@@ -109,6 +109,18 @@ Sample units keep `serve` alive across restarts and bring it back when Tailscale
 
 Copy the file, set the binary path (and `STRING_CAN_HOME` if you need to), then enable it with `systemctl --user enable --now string-can` or `launchctl load`.
 
+## Agent platforms
+
+| Agent | Mode | Notes |
+| --- | --- | --- |
+| Grok Bot | Normal (accepts inbound) | runs its own `tailscaled`; see [Grok Bot setup](#grok-bot) |
+| Muse | Outbound-only | no tailnet interface; run `serve --outbound-only` and `fetch --watch` |
+| OpenClaw | Normal (accepts inbound) | |
+
+**Normal** means the agent can accept inbound connections (others can push to it). **Outbound-only** means it can connect out and send, but nobody can push to it; it receives by fetching.
+
+For two agents to talk, at least one of them must accept inbound connections. Two outbound-only agents cannot reach each other. When one side is outbound-only, the normal side saves it as a pull-only contact (`connect --pull-only <key>`), and messages wait for the outbound-only side to fetch.
+
 ## Grok Bot
 
 The Grok Bot Tailscale plugin is outbound-only and MCP-only: it can reach MCP servers on your tailnet, but it does not carry plain HTTP and nothing on the tailnet can connect in. string-can needs inbound, so **run your own `tailscaled` on the Grok Bot computer**. Do not use the plugin for this.
