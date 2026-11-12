@@ -41,8 +41,9 @@ Usage:
   string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]
   string-can wake show <public-key>
   string-can wake clear <public-key>
-  string-can send <public-key> <text>
+  string-can send [--auto] <public-key> <text>
   string-can thread <public-key> [--since <id>]
+  string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]
   string-can fetch <public-key> [--watch] [--every <duration>]
   string-can status
   string-can doctor
@@ -57,6 +58,8 @@ Environment:
   STRING_CAN_WAKE_POLL       pause between those health checks (default 1s)
   STRING_CAN_WAKE_PROXY      proxy for wake POSTs only (http, https, socks5 URL, or direct).
                              Unset uses HTTP_PROXY / HTTPS_PROXY. A per-contact --proxy wins.
+  STRING_CAN_AUTO_CAP        consecutive send --auto calls per peer before hold (default 6, 0 disables)
+  STRING_CAN_AUTO_COOLDOWN   minimum gap between send --auto calls to one peer (default 0s, off)
 `
 
 type env struct {
@@ -107,6 +110,8 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return e.cmdSend(ctx, rest)
 	case "thread":
 		return e.cmdThread(rest)
+	case "inbox":
+		return e.cmdInbox(ctx, rest)
 	case "fetch":
 		return e.cmdFetch(ctx, rest)
 	case "status":
@@ -336,7 +341,10 @@ func (e env) cmdContacts(args []string) int {
 }
 
 func (e env) cmdSend(ctx context.Context, args []string) int {
-	_, pos, help, err := flags("send", args, nil)
+	var auto bool
+	fs := newFlagSet("send")
+	fs.BoolVar(&auto, "auto", false, "count this send as an auto-reply")
+	pos, help, err := parseWith(fs, args, nil)
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("send"))
 		return 0
@@ -345,7 +353,7 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 		return e.fail(err)
 	}
 	if len(pos) != 2 {
-		return e.fail(fmt.Errorf("usage: string-can send <public-key> <text>"))
+		return e.fail(fmt.Errorf("usage: string-can send [--auto] <public-key> <text>"))
 	}
 	key, err := canon.NormalizeKey(pos[0])
 	if err != nil {
@@ -373,7 +381,13 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
-	ts := time.Now().UnixMilli()
+	now := time.Now()
+	if auto {
+		if err := autoGuard(st, key, now); err != nil {
+			return e.fail(err)
+		}
+	}
+	ts := now.UnixMilli()
 	body, err := canon.Encode(from, ts, text)
 	if err != nil {
 		return e.fail(err)
@@ -390,6 +404,13 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 		Nudged:    false,
 	})
 	if err != nil {
+		return e.fail(err)
+	}
+	if auto {
+		if err := st.RecordAutoSend(key, text, ts); err != nil {
+			return e.fail(err)
+		}
+	} else if err := st.ResetAuto(key); err != nil {
 		return e.fail(err)
 	}
 	if c.PullOnly {
@@ -638,9 +659,11 @@ func commandHelp(name string) string {
 	case "wake":
 		return "usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]\n       string-can wake show <public-key>\n       string-can wake clear <public-key>\n"
 	case "send":
-		return "usage: string-can send <public-key> <text>\n"
+		return "usage: string-can send [--auto] <public-key> <text>\n"
 	case "thread":
 		return "usage: string-can thread <public-key> [--since <id>]\n"
+	case "inbox":
+		return "usage: string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]\n"
 	case "fetch":
 		return "usage: string-can fetch <public-key> [--watch] [--every <duration>]\n"
 	case "status":

@@ -221,6 +221,9 @@ func (d Dir) Serving() (bool, error) {
 // ErrAlreadyWatching means fetch --watch already holds the lock for this peer.
 var ErrAlreadyWatching = errors.New("already watching")
 
+// ErrInboxBusy means a consuming inbox already holds the lock.
+var ErrInboxBusy = errors.New("inbox already running")
+
 func fetchLockName(pub string) string {
 	return "fetch-" + pub + ".lock"
 }
@@ -238,6 +241,26 @@ func (d Dir) FetchLock(pub string) (*Lock, error) {
 		f.Close()
 		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, ErrAlreadyWatching
+		}
+		return nil, err
+	}
+	return &Lock{f: f}, nil
+}
+
+// InboxLock takes the exclusive lock a consuming inbox holds.
+// inbox --peek does not take it, so an operator can look while a loop runs.
+func (d Dir) InboxLock() (*Lock, error) {
+	if err := d.Ensure(); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(d.file("inbox.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, ErrInboxBusy
 		}
 		return nil, err
 	}

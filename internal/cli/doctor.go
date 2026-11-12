@@ -255,6 +255,7 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 	} else {
 		fmt.Fprintln(e.stdout, "webhook: configured")
 	}
+	e.reportReply(dir, &ok)
 	fmt.Fprintf(e.stdout, "wake proxy: %s\n", wake.ProxyLabel(""))
 
 	st, err := store.Open(dir.DBPath())
