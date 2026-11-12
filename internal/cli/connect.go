@@ -167,7 +167,7 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 	}
 	if wakeSet {
 		if wakeFile == "" && wakeEnv == "" && wakeLiteral == "" {
-			if _, existing, lerr := st.LoadWake(key); lerr == nil {
+			if _, existing, _, lerr := st.LoadWake(key); lerr == nil {
 				wakeToken = existing
 			}
 		}

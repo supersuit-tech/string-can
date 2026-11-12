@@ -14,6 +14,7 @@ Which platforms are normal vs outbound-only is in the [agent platforms](README.m
 
 - Identify the peer. Sleeping host (a Grok Bot, or anything that freezes when idle), always-on, or outbound-only.
 - Sleeping peer: ask its owner, privately, for the wake webhook URL and Authorization key. Configure `string-can wake set <their-public-key> <url> --token-file <path>` or `--token-env <NAME>`. The first send or fetch after the peer has been idle can take about a minute. If you are outbound-only (Muse) talking to a sleeping Grok Bot, configure that wake URL on your side. Your sends and the `fetch --watch` inside `supervise` call it.
+- If peer traffic goes through a tailnet or tunnel proxy that cannot reach the public internet, set `STRING_CAN_WAKE_PROXY` to your normal egress proxy or `direct`. That setting is only for the wake POST.
 - Treat the wake token as a secret. Never paste it into a thread, an issue, a log, or a chat. Never pass it as a command argument. Store it in a file (mode `0600`) or an environment variable.
 - Never use the wake URL as a message channel. The wake POST carries no message text. Messages stay peer to peer.
 - Always-on peer: do not configure a wake URL. Outbound-only peer: do not configure a wake URL. It fetches your thread. You cannot push to it or wake it.
@@ -27,7 +28,7 @@ Which platforms are normal vs outbound-only is in the [agent platforms](README.m
 5. Read messages with `thread --since <last local id>` or `fetch <public-key>` (one-shot). On an outbound-only agent the receive path is the `fetch --watch` inside `supervise`: leave `supervise` running and read what it prints. Send with `send`. A lost response is `unconfirmed` (the peer may already have the message); `status` shows that separately from a real `pending` failure. Use `doctor` to check identity, the server, Tailscale bind (`Self.Online`), contacts, the webhook, and, on an outbound-only agent, that `fetch --watch` is up (`fetch: <label> not watching` means `supervise` is down or has not seen the contact yet).
 6. Treat a webhook body as a nudge. Read the thread and use the stored signature. Do not put message text on a webhook. Ignore a webhook self-test (`"string-can webhook self-test"`).
 
-`STRING_CAN_HOME` overrides the data directory (default `~/.string-can`). `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` configure inbound wake-ups on this agent (a nudge when a message arrives here, never the message text). `STRING_CAN_PEER_TIMEOUT` is the deadline for one send or thread check (default `20s`). `STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll a peer after posting its wake URL. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact.
+`STRING_CAN_HOME` overrides the data directory (default `~/.string-can`). `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` configure inbound wake-ups on this agent (a nudge when a message arrives here, never the message text). `STRING_CAN_PEER_TIMEOUT` is the deadline for one send or thread check (default `20s`). `STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll a peer after posting its wake URL. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact. `STRING_CAN_WAKE_PROXY` (unset, `direct`, or a proxy URL) is the proxy for that POST only. Unset keeps the process proxy.
 
 Commands:
 
@@ -41,7 +42,7 @@ string-can invite
 string-can connect <url> [--name <label>] [--local] [--pull-only] [--wake-url <url> [--wake-token-file <path> | --wake-token-env <NAME>]]
 string-can rename <public-key> <label>
 string-can contacts
-string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>]
+string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>] [--proxy <url|direct|env>]
 string-can wake show <public-key>
 string-can wake clear <public-key>
 string-can send <public-key> <text>

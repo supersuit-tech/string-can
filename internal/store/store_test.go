@@ -176,12 +176,20 @@ func TestWakeStoredSeparatelyFromContact(t *testing.T) {
 	if strings.Contains(c.Label+c.BaseURL+c.StatedName, token) {
 		t.Fatal("token copied onto a display field")
 	}
-	gotURL, gotToken, err := st.LoadWake(peer)
-	if err != nil || gotURL != url || gotToken != token {
-		t.Fatalf("load %q %q %v", gotURL, gotToken, err)
+	const proxy = "http://proxyuser:s3cret@egress.example:3128"
+	if err := st.SetWakeProxy(peer, proxy); err != nil {
+		t.Fatal(err)
+	}
+	gotURL, gotToken, gotProxy, err := st.LoadWake(peer)
+	if err != nil || gotURL != url || gotToken != token || gotProxy != proxy {
+		t.Fatalf("load %q %q %q %v", gotURL, gotToken, gotProxy, err)
+	}
+	c, err = st.GetContact(peer)
+	if err != nil || c.WakeProxy != proxy {
+		t.Fatalf("contact proxy %+v %v", c, err)
 	}
 	listed, err := st.ListContacts()
-	if err != nil || len(listed) != 1 || listed[0].WakeURL != url || !listed[0].WakeTokenSet {
+	if err != nil || len(listed) != 1 || listed[0].WakeURL != url || !listed[0].WakeTokenSet || listed[0].WakeProxy != proxy {
 		t.Fatalf("list %+v %v", listed, err)
 	}
 	// Relabeling must not wipe the webhook or the token.
@@ -189,19 +197,19 @@ func TestWakeStoredSeparatelyFromContact(t *testing.T) {
 	if err := st.UpsertContact(c); err != nil {
 		t.Fatal(err)
 	}
-	gotURL, gotToken, err = st.LoadWake(peer)
-	if err != nil || gotURL != url || gotToken != token {
-		t.Fatalf("upsert wiped wake %q %q %v", gotURL, gotToken, err)
+	gotURL, gotToken, gotProxy, err = st.LoadWake(peer)
+	if err != nil || gotURL != url || gotToken != token || gotProxy != proxy {
+		t.Fatalf("upsert wiped wake %q %q %q %v", gotURL, gotToken, gotProxy, err)
 	}
 	if err := st.ClearWake(peer); err != nil {
 		t.Fatal(err)
 	}
 	c, err = st.GetContact(peer)
-	if err != nil || c.WakeURL != "" || c.WakeTokenSet {
+	if err != nil || c.WakeURL != "" || c.WakeTokenSet || c.WakeProxy != "" {
 		t.Fatalf("after clear %+v %v", c, err)
 	}
-	if _, gotToken, err = st.LoadWake(peer); err != nil || gotToken != "" {
-		t.Fatalf("token remained %q %v", gotToken, err)
+	if _, gotToken, gotProxy, err = st.LoadWake(peer); err != nil || gotToken != "" || gotProxy != "" {
+		t.Fatalf("token remained %q proxy %q %v", gotToken, gotProxy, err)
 	}
 }
 
@@ -255,11 +263,62 @@ VALUES (?, 'bot', 'http://127.0.0.1:1', 'bot', 1, 0)
 	if err != nil || !claimed {
 		t.Fatalf("boundary claim %v %v", claimed, err)
 	}
+	if err := st.SetWakeProxy(peer, "direct"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, gotProxy, err := st.LoadWake(peer); err != nil || gotProxy != "direct" {
+		t.Fatalf("proxy %q %v", gotProxy, err)
+	}
 	if err := st.ClearWake(peer); err != nil {
 		t.Fatal(err)
+	}
+	if _, _, gotProxy, err := st.LoadWake(peer); err != nil || gotProxy != "" {
+		t.Fatalf("proxy after clear %q %v", gotProxy, err)
 	}
 	claimed, err = st.ClaimWake(peer, now+interval*2, interval)
 	if err != nil || claimed {
 		t.Fatalf("claim without url %v %v", claimed, err)
+	}
+}
+
+func TestWakeProxyMigratesFromExistingWake(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pr16.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := strings.Repeat("ef", 32)
+	const (
+		token = "kept-token"
+		url   = "https://hooks.example.com/kept"
+	)
+	if _, err := db.Exec(`
+CREATE TABLE contacts (
+	public_key TEXT PRIMARY KEY,
+	label TEXT NOT NULL,
+	base_url TEXT NOT NULL,
+	stated_name TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	pull_only INTEGER NOT NULL DEFAULT 0,
+	wake_url TEXT NOT NULL DEFAULT '',
+	wake_token TEXT NOT NULL DEFAULT '',
+	wake_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO contacts (public_key, label, base_url, stated_name, created_at, pull_only, wake_url, wake_token, wake_at)
+VALUES (?, 'bot', 'http://127.0.0.1:1', 'bot', 1, 0, ?, ?, 5)
+`, peer, url, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	gotURL, gotToken, gotProxy, err := st.LoadWake(peer)
+	if err != nil || gotURL != url || gotToken != token || gotProxy != "" {
+		t.Fatalf("migrated %q %q %q %v", gotURL, gotToken, gotProxy, err)
 	}
 }

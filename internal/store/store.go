@@ -35,6 +35,11 @@ type Contact struct {
 	WakeURL string
 	// WakeTokenSet is true when a bearer token is stored for WakeURL.
 	WakeTokenSet bool
+	// WakeProxy is an optional per-contact proxy for the wake POST only.
+	// Empty inherits STRING_CAN_WAKE_PROXY, then the process proxy environment.
+	// "direct" means no proxy. Any other value is a proxy URL and may contain
+	// credentials. Callers must mask userinfo before printing or logging it.
+	WakeProxy string
 }
 
 // Message is a stored thread row.
@@ -89,6 +94,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 	pull_only INTEGER NOT NULL DEFAULT 0,
 	wake_url TEXT NOT NULL DEFAULT '',
 	wake_token TEXT NOT NULL DEFAULT '',
+	wake_proxy TEXT NOT NULL DEFAULT '',
 	wake_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -184,6 +190,7 @@ func migrateContacts(db *sql.DB) error {
 		{"pull_only", `ALTER TABLE contacts ADD COLUMN pull_only INTEGER NOT NULL DEFAULT 0`},
 		{"wake_url", `ALTER TABLE contacts ADD COLUMN wake_url TEXT NOT NULL DEFAULT ''`},
 		{"wake_token", `ALTER TABLE contacts ADD COLUMN wake_token TEXT NOT NULL DEFAULT ''`},
+		{"wake_proxy", `ALTER TABLE contacts ADD COLUMN wake_proxy TEXT NOT NULL DEFAULT ''`},
 		{"wake_at", `ALTER TABLE contacts ADD COLUMN wake_at INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, alt := range alters {
@@ -234,7 +241,7 @@ ON CONFLICT(public_key) DO UPDATE SET
 	return err
 }
 
-const contactCols = `public_key, label, base_url, stated_name, created_at, pull_only, wake_url, CASE WHEN wake_token != '' THEN 1 ELSE 0 END`
+const contactCols = `public_key, label, base_url, stated_name, created_at, pull_only, wake_url, CASE WHEN wake_token != '' THEN 1 ELSE 0 END, wake_proxy`
 
 // GetContact loads a contact by public key.
 // It reports whether a wake token is stored and does not return the token.
@@ -244,7 +251,7 @@ func (s *Store) GetContact(pub string) (Contact, error) {
 	err := s.db.QueryRow(`
 SELECT `+contactCols+`
 FROM contacts WHERE public_key = ?
-`, pub).Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly, &c.WakeURL, &tokenSet)
+`, pub).Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly, &c.WakeURL, &tokenSet, &c.WakeProxy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Contact{}, fmt.Errorf("not a contact")
 	}
@@ -275,7 +282,7 @@ FROM contacts ORDER BY created_at ASC, public_key ASC
 	for rows.Next() {
 		var c Contact
 		var pullOnly, tokenSet int
-		if err := rows.Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly, &c.WakeURL, &tokenSet); err != nil {
+		if err := rows.Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly, &c.WakeURL, &tokenSet, &c.WakeProxy); err != nil {
 			return nil, err
 		}
 		c.PullOnly = pullOnly != 0
@@ -287,6 +294,7 @@ FROM contacts ORDER BY created_at ASC, public_key ASC
 
 // SetWake stores a thaw webhook for a contact. token may be empty.
 // It clears the rate-limit timestamp so the next failure can wake immediately.
+// It does not change the per-contact wake proxy.
 func (s *Store) SetWake(pub, url, token string) error {
 	res, err := s.db.Exec(`
 UPDATE contacts SET wake_url = ?, wake_token = ?, wake_at = 0 WHERE public_key = ?
@@ -304,10 +312,28 @@ UPDATE contacts SET wake_url = ?, wake_token = ?, wake_at = 0 WHERE public_key =
 	return nil
 }
 
-// ClearWake removes the thaw webhook, token, and rate-limit timestamp.
+// SetWakeProxy stores the per-contact wake proxy. proxy is "" (inherit),
+// "direct", or a proxy URL. It does not change the webhook, token, or
+// rate-limit timestamp.
+func (s *Store) SetWakeProxy(pub, proxy string) error {
+	res, err := s.db.Exec(`UPDATE contacts SET wake_proxy = ? WHERE public_key = ?`, proxy, pub)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("not a contact")
+	}
+	return nil
+}
+
+// ClearWake removes the thaw webhook, token, per-contact proxy, and rate-limit timestamp.
 func (s *Store) ClearWake(pub string) error {
 	res, err := s.db.Exec(`
-UPDATE contacts SET wake_url = '', wake_token = '', wake_at = 0 WHERE public_key = ?
+UPDATE contacts SET wake_url = '', wake_token = '', wake_proxy = '', wake_at = 0 WHERE public_key = ?
 `, pub)
 	if err != nil {
 		return err
@@ -322,14 +348,14 @@ UPDATE contacts SET wake_url = '', wake_token = '', wake_at = 0 WHERE public_key
 	return nil
 }
 
-// LoadWake returns the stored webhook URL and bearer token.
-// Callers must not log the token.
-func (s *Store) LoadWake(pub string) (url, token string, err error) {
-	err = s.db.QueryRow(`SELECT wake_url, wake_token FROM contacts WHERE public_key = ?`, pub).Scan(&url, &token)
+// LoadWake returns the stored webhook URL, bearer token, and per-contact proxy.
+// Callers must not log the token or proxy credentials.
+func (s *Store) LoadWake(pub string) (url, token, proxy string, err error) {
+	err = s.db.QueryRow(`SELECT wake_url, wake_token, wake_proxy FROM contacts WHERE public_key = ?`, pub).Scan(&url, &token, &proxy)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", fmt.Errorf("not a contact")
+		return "", "", "", fmt.Errorf("not a contact")
 	}
-	return url, token, err
+	return url, token, proxy, err
 }
 
 // ClaimWake records a wake attempt if none was recorded within minInterval

@@ -24,6 +24,7 @@ import (
 func TestWakeConfigMasksToken(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("STRING_CAN_HOME", home)
+	t.Setenv("STRING_CAN_WAKE_PROXY", "")
 	const (
 		token   = "config-secret-token"
 		message = "do-not-log-this-message"
@@ -70,8 +71,11 @@ func TestWakeConfigMasksToken(t *testing.T) {
 
 	stdout, stderr, code = runCLI(t, "doctor")
 	assertNoSecret(t, stdout+stderr, token, message)
-	if !strings.Contains(stdout, "wake: https://hooks.example.com/... token "+wake.MaskedToken) {
+	if !strings.Contains(stdout, "wake: https://hooks.example.com/... token "+wake.MaskedToken+" proxy env") {
 		t.Fatalf("doctor %s", stdout)
+	}
+	if !strings.Contains(stdout, "wake proxy: env") {
+		t.Fatalf("doctor proxy %s", stdout)
 	}
 
 	st, err := store.Open(filepath.Join(home, "string-can.db"))
@@ -79,7 +83,7 @@ func TestWakeConfigMasksToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	gotURL, gotToken, err := st.LoadWake(key)
+	gotURL, gotToken, _, err := st.LoadWake(key)
 	if err != nil || gotToken != token || !strings.Contains(gotURL, token) {
 		t.Fatalf("stored %q %q %v", gotURL, gotToken, err)
 	}
@@ -89,7 +93,7 @@ func TestWakeConfigMasksToken(t *testing.T) {
 		t.Fatalf("set url only %d %s %s", code, stdout, stderr)
 	}
 	assertNoSecret(t, stdout+stderr, token, message)
-	gotURL, gotToken, err = st.LoadWake(key)
+	gotURL, gotToken, _, err = st.LoadWake(key)
 	if err != nil || gotToken != token || gotURL != "https://hooks.example.com/renamed" {
 		t.Fatalf("url-only set %q %q %v", gotURL, gotToken, err)
 	}
@@ -110,9 +114,118 @@ func TestWakeConfigMasksToken(t *testing.T) {
 	if strings.Contains(stdout, wake.MaskedToken) || strings.Contains(stdout, "hooks.example.com") {
 		t.Fatalf("clear %s", stdout)
 	}
-	_, gotToken, err = st.LoadWake(key)
+	_, gotToken, _, err = st.LoadWake(key)
 	if err != nil || gotToken != "" {
 		t.Fatalf("token after clear %q %v", gotToken, err)
+	}
+}
+
+func TestWakeProxyMaskedInCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("STRING_CAN_HOME", home)
+	t.Setenv("STRING_CAN_WAKE_PROXY", "")
+	const (
+		secret = "proxy-secret-password"
+		user   = "proxyuser"
+		token  = "config-secret-token"
+	)
+	proxyURL := "http://" + user + ":" + secret + "@proxy.example:3128"
+	masked := "http://********@proxy.example:3128"
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"v":1,"name":"bot","public_key":"`+strings.Repeat("ab", 32)+`"}`)
+	}))
+	t.Cleanup(peer.Close)
+	key := strings.Repeat("ab", 32)
+	t.Setenv("GROK_WAKE_TOKEN", token)
+	stdout, stderr, code := runCLI(t, "connect", "--local", "--name", "bot",
+		"--wake-url", "https://hooks.example.com/v1/wake",
+		"--wake-token-env", "GROK_WAKE_TOKEN",
+		key, peer.URL)
+	if code != 0 {
+		t.Fatalf("connect %d %s %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"wake_proxy":"env"`) {
+		t.Fatalf("connect proxy %s", stdout)
+	}
+
+	stdout, stderr, code = runCLI(t, "wake", "show", key)
+	if code != 0 || !strings.Contains(stdout, `"wake_proxy":"env"`) {
+		t.Fatalf("show %d %s %s", code, stdout, stderr)
+	}
+
+	t.Setenv("STRING_CAN_WAKE_PROXY", proxyURL)
+	stdout, stderr, code = runCLI(t, "wake", "show", key)
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if code != 0 || !strings.Contains(stdout, `"wake_proxy":"`+masked+`"`) {
+		t.Fatalf("show env %d %s", code, stdout)
+	}
+	stdout, stderr, code = runCLI(t, "contacts")
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if !strings.Contains(stdout, `"wake_proxy":"`+masked+`"`) {
+		t.Fatalf("contacts %s", stdout)
+	}
+	stdout, stderr, code = runCLI(t, "doctor")
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if !strings.Contains(stdout, "wake proxy: "+masked) || !strings.Contains(stdout, "proxy "+masked) {
+		t.Fatalf("doctor %s", stdout)
+	}
+
+	stdout, stderr, code = runCLI(t, "wake", "set", key, "https://hooks.example.com/renamed", "--proxy", "direct")
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if code != 0 || !strings.Contains(stdout, `"wake_proxy":"direct"`) {
+		t.Fatalf("set direct %d %s %s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, "doctor")
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if !strings.Contains(stdout, "wake proxy: "+masked) || !strings.Contains(stdout, "proxy direct") {
+		t.Fatalf("doctor override %s", stdout)
+	}
+
+	stdout, stderr, code = runCLI(t, "wake", "set", key, "https://hooks.example.com/nope", "--proxy", "ftp://"+user+":"+secret+"@proxy.example")
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if code == 0 {
+		t.Fatalf("accepted bad proxy %s", stdout+stderr)
+	}
+	stdout, stderr, code = runCLI(t, "wake", "show", key)
+	if !strings.Contains(stdout, `"wake_url":"https://hooks.example.com/..."`) || !strings.Contains(stdout, `"wake_proxy":"direct"`) {
+		t.Fatalf("bad proxy wrote %s", stdout)
+	}
+	if strings.Contains(stdout, "/nope") {
+		t.Fatalf("bad proxy changed url %s", stdout)
+	}
+
+	stdout, stderr, code = runCLI(t, "wake", "set", key, "https://hooks.example.com/again")
+	if code != 0 || !strings.Contains(stdout, `"wake_proxy":"direct"`) {
+		t.Fatalf("url-only %d %s %s", code, stdout, stderr)
+	}
+
+	stdout, stderr, code = runCLI(t, "wake", "set", key, "https://hooks.example.com/again", "--proxy", "env")
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if code != 0 || !strings.Contains(stdout, `"wake_proxy":"`+masked+`"`) {
+		t.Fatalf("clear override %d %s %s", code, stdout, stderr)
+	}
+
+	stdout, stderr, code = runCLI(t, "wake", "set", key, "https://hooks.example.com/again", "--proxy", "http://"+user+":"+secret+"@alt.example:9")
+	assertProxyMasked(t, stdout+stderr, secret, user)
+	if code != 0 || !strings.Contains(stdout, `"wake_proxy":"http://********@alt.example:9"`) {
+		t.Fatalf("contact url %d %s %s", code, stdout, stderr)
+	}
+	st, err := store.Open(filepath.Join(home, "string-can.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	_, _, gotProxy, err := st.LoadWake(key)
+	if err != nil || !strings.Contains(gotProxy, secret) {
+		t.Fatalf("stored proxy %q %v", gotProxy, err)
+	}
+}
+
+func assertProxyMasked(t *testing.T, text, secret, user string) {
+	t.Helper()
+	if strings.Contains(text, secret) || strings.Contains(text, user) {
+		t.Fatalf("output leaked proxy credentials: %s", text)
 	}
 }
 
