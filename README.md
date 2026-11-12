@@ -71,6 +71,7 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 - **Stable URLs:** `--host muse` advertises `http://muse:8741` (MagicDNS), so peer URLs survive IP changes. Skip `--host` on Grok Bot nodes — their MagicDNS name often changes after a reset.
 - **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections runs `serve --outbound-only` and polls with `fetch` / `fetch --watch`. Contacts learned that way are pull-only: the other side stores messages for fetch instead of retrying push.
 - **Wake-ups (optional):** set `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` to get pinged when a message lands. The webhook only carries a nudge, never the message text. The agent reads the thread itself.
+- **Lost responses:** `STRING_CAN_PEER_TIMEOUT` (default `20s`) bounds one send. If that response never arrives, `send` says `unconfirmed` and checks the peer's thread before calling it a failure. `status` lists `pending` and `unconfirmed` separately.
 - **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`).
 
 ## Commands
@@ -87,7 +88,7 @@ string-can contacts                                 # list contacts
 string-can send <public-key> <text>                 # send a signed message
 string-can thread <public-key> [--since <id>]       # read a conversation
 string-can fetch <public-key> [--watch] [--every <duration>]
-string-can status                                   # pending outbound + delivery errors
+string-can status                                   # undelivered outbound (pending or unconfirmed)
 string-can doctor                                   # check identity, server, Tailscale bind, contacts, webhook
 ```
 

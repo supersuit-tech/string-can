@@ -89,7 +89,7 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 }
 
 func (e env) fetchOnce(ctx context.Context, st *store.Store, baseURL, ourKey, key string) (int, int) {
-	remote, err := push.Thread(ctx, push.DefaultClient(), baseURL, ourKey)
+	remote, err := push.Thread(ctx, push.PeerClient(), baseURL, ourKey)
 	if err != nil {
 		fmt.Fprintf(e.stderr, "string-can: %v\n", err)
 		return 0, 1
@@ -153,12 +153,17 @@ func (e env) cmdStatus(args []string) int {
 		return e.fail(err)
 	}
 	for _, m := range msgs {
+		state := "pending"
+		if m.State == store.StateUnconfirmed {
+			state = store.StateUnconfirmed
+		}
 		if code := e.writeJSON(struct {
 			ID        int64  `json:"id"`
 			Peer      string `json:"peer"`
 			Ts        int64  `json:"ts"`
+			State     string `json:"state"`
 			LastError string `json:"last_error"`
-		}{m.ID, m.PeerPub, m.Ts, m.LastError}); code != 0 {
+		}{m.ID, m.PeerPub, m.Ts, state, m.LastError}); code != 0 {
 			return code
 		}
 	}
@@ -244,6 +249,13 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 		ok = false
 	} else {
 		fmt.Fprintf(e.stdout, "pending: %d\n", pending)
+	}
+	unconfirmed, err := st.CountUnconfirmed()
+	if err != nil {
+		fmt.Fprintf(e.stdout, "unconfirmed: %v\n", err)
+		ok = false
+	} else if unconfirmed > 0 {
+		fmt.Fprintf(e.stdout, "unconfirmed: %d\n", unconfirmed)
 	}
 
 	contacts, err := st.ListContacts()
