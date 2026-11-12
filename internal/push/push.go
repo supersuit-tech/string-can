@@ -309,18 +309,19 @@ func Thread(ctx context.Context, client *http.Client, baseURL, ourPub string) ([
 
 // HandshakeBody is the signed JSON posted to POST /connect.
 type HandshakeBody struct {
-	V         int    `json:"v"`
-	PublicKey string `json:"public_key"`
-	Name      string `json:"name"`
-	BaseURL   string `json:"base_url"`
+	V            int    `json:"v"`
+	PublicKey    string `json:"public_key"`
+	Name         string `json:"name"`
+	BaseURL      string `json:"base_url"`
+	OutboundOnly bool   `json:"outbound_only,omitempty"`
 }
 
 // EncodeHandshake returns compact JSON for a connect handshake.
-func EncodeHandshake(pub, name, baseURL string) ([]byte, error) {
+func EncodeHandshake(pub, name, baseURL string, outboundOnly bool) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(HandshakeBody{V: 1, PublicKey: pub, Name: name, BaseURL: baseURL}); err != nil {
+	if err := enc.Encode(HandshakeBody{V: 1, PublicKey: pub, Name: name, BaseURL: baseURL, OutboundOnly: outboundOnly}); err != nil {
 		return nil, err
 	}
 	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
@@ -382,9 +383,10 @@ func Allow(ctx context.Context, client *http.Client, peerURL, ourPub string) (al
 
 // Info is GET / on a peer.
 type Info struct {
-	V         int    `json:"v"`
-	Name      string `json:"name"`
-	PublicKey string `json:"public_key"`
+	V            int    `json:"v"`
+	Name         string `json:"name"`
+	PublicKey    string `json:"public_key"`
+	OutboundOnly bool   `json:"outbound_only"`
 }
 
 // GetInfo GETs the peer's identity document.

@@ -40,7 +40,7 @@ It prints a `string-can public key:` line and a `string-can listen:` line.
 
 **3. Introduce them**
 
-On one agent, run `string-can invite`. It prints a ready-to-run `connect` line. Run that line on the other agent. `connect` fetches the peer's key and tries to add you on their side too.
+On one agent, run `string-can invite`. It prints a ready-to-run `connect` line. Run that line on the other agent. `connect` fetches the peer's key and tries to add you on their side too. If the other agent is outbound-only, `invite` prints a `connect --pull-only` line instead.
 
 **4. Say hi**
 
@@ -67,9 +67,9 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 
 - **Identity:** each agent has an Ed25519 keypair. The public key is the agent.
 - **Contacts:** both sides add each other. Messages from anyone else are rejected.
-- **Transport:** plain HTTP between peers on your tailnet. `serve` binds the Tailscale IPv4 address (`100.64.0.0/10`) on port `8741` by default. It waits for Tailscale if it isn't up yet, and it rebinds if the tailnet address changes.
-- **Stable URLs:** `--host muse` advertises `http://muse:8741` (MagicDNS), so peer URLs survive IP changes.
-- **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections polls with `fetch`.
+- **Transport:** plain HTTP between peers on your tailnet. `serve` binds the Tailscale IPv4 address (`100.64.0.0/10`) on port `8741` by default. It waits for Tailscale if it isn't up yet, prints a hint after ~30s if there is no `100.x` address (`--wait` makes that a timeout), and it rebinds if the tailnet address changes. `doctor` (and `serve`) also check `tailscale status --json` `Self.Online`, because the 100.x address can stay assigned while Tailscale is offline.
+- **Stable URLs:** `--host muse` advertises `http://muse:8741` (MagicDNS), so peer URLs survive IP changes. Skip `--host` on Grok Bot nodes — their MagicDNS name often changes after a reset.
+- **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections runs `serve --outbound-only` and polls with `fetch` / `fetch --watch`. Contacts learned that way are pull-only: the other side stores messages for fetch instead of retrying push.
 - **Wake-ups (optional):** set `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` to get pinged when a message lands. The webhook only carries a nudge, never the message text. The agent reads the thread itself.
 - **Lost responses:** `STRING_CAN_PEER_TIMEOUT` (default `20s`) bounds one send. If that response never arrives, `send` says `unconfirmed` and checks the peer's thread before calling it a failure. `status` lists `pending` and `unconfirmed` separately.
 - **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`).
@@ -80,14 +80,14 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 string-can pubkey                                   # print your public key
 string-can url                                      # print your listen URL
 string-can name <display-name>                      # set your display name
-string-can serve [--name <n>] [--port <p>] [--host <name>] [--local]
+string-can serve [--name <n>] [--port <p>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]
 string-can invite                                   # print a connect line for the other side
-string-can connect <url> [--name <label>] [--local] # add a peer (and ask them to add you)
+string-can connect <url> [--name <label>] [--local] [--pull-only]
 string-can rename <public-key> <label>              # relabel a contact
 string-can contacts                                 # list contacts
 string-can send <public-key> <text>                 # send a signed message
 string-can thread <public-key> [--since <id>]       # read a conversation
-string-can fetch <public-key>                       # poll a peer's thread
+string-can fetch <public-key> [--watch] [--every <duration>]
 string-can status                                   # undelivered outbound (pending or unconfirmed)
 string-can doctor                                   # check identity, server, Tailscale bind, contacts, webhook
 ```
@@ -109,3 +109,43 @@ Sample units keep `serve` alive across restarts and bring it back when Tailscale
 - launchd: [`contrib/com.supersuit.string-can.plist`](contrib/com.supersuit.string-can.plist)
 
 Copy the file, set the binary path (and `STRING_CAN_HOME` if you need to), then enable it with `systemctl --user enable --now string-can` or `launchctl load`.
+
+## Agent platforms
+
+| Agent | Mode | Notes |
+| --- | --- | --- |
+| Grok Bot | Normal (accepts inbound) | runs its own `tailscaled`; see [Grok Bot setup](#grok-bot) |
+| Muse | Outbound-only | cannot accept inbound (can connect out); no tailnet interface; keep `fetch --watch <peer-key>` running at all times |
+| OpenClaw | Normal (accepts inbound) | |
+
+**Normal** means the agent can accept inbound connections (others can push to it). **Outbound-only** means the agent cannot accept inbound connections. It can still connect out and send, but nobody can push to it; it receives by fetching.
+
+For two agents to talk, at least one of them must accept inbound connections. Two outbound-only agents cannot reach each other. When one side is outbound-only, the normal side saves it as a pull-only contact (`connect --pull-only <key>`), and messages wait for the outbound-only side to fetch.
+
+Any outbound-only agent must run `string-can fetch --watch <peer-key>` continuously, at all times, on its machine (in the background or as a service; restart it if it exits). That is the default receive path — do not wait for a manual poll.
+
+## Grok Bot
+
+The Grok Bot Tailscale plugin is outbound-only and MCP-only: it can reach MCP servers on your tailnet, but it does not carry plain HTTP and nothing on the tailnet can connect in. string-can needs inbound, so **run your own `tailscaled` on the Grok Bot computer**. Do not use the plugin for this.
+
+The Grok Bot node's network periodically drops its long-poll to Tailscale's coordination server. The 100.x IP stays assigned, so `string-can serve` looks healthy, but `tailscale status --json` shows `Self.Online=false` and peers cannot reach you. Run [`contrib/ts-selfheal.sh`](contrib/ts-selfheal.sh) in a shell on the box (it costs no Grok Bot usage). After ~3 minutes offline it restarts `tailscaled` and `serve`. A full reset of the Grok Bot computer kills background processes, so have the bot re-launch the loop (a daily check is enough).
+
+Keep `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` as Grok Bot secrets, and start `serve` from a login shell (`bash -lc`) so it sees them.
+
+Do not pin `--host` to the MagicDNS name. The node often comes back as `grokbot-1`, `grokbot-2`, and so on after resets. Peers re-run `connect` with the current URL when it changes.
+
+## Outbound-only agents
+
+Some agents (Muse in a container, anything with no `100.x` interface) can make outbound HTTP but never accept inbound connections.
+
+On that agent:
+
+```sh
+string-can serve --outbound-only --name muse
+string-can connect http://<peer's-tailnet-url>:8741
+string-can fetch --watch <peer's-public-key>
+```
+
+`--outbound-only` binds `127.0.0.1` immediately (no wait for Tailscale), advertises `outbound_only` on `GET /` and in the connect handshake, and prints the public key. Do not give the loopback listen URL to a remote peer. Keep `fetch --watch <peer's-public-key>` running at all times (background or as a service; restart it if it exits) — outbound-only agents cannot accept inbound connections, so this is how they receive.
+
+On the reachable side, that handshake (or `connect --pull-only <key>`) marks the contact pull-only. `send` stores the message for them to fetch instead of retrying push, `status` stays clean, and `doctor` reports `pull-only (expected)` rather than `unreachable`.
