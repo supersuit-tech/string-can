@@ -11,6 +11,7 @@ import (
 	"github.com/supersuit-tech/string-can/internal/push"
 	"github.com/supersuit-tech/string-can/internal/server"
 	"github.com/supersuit-tech/string-can/internal/store"
+	"github.com/supersuit-tech/string-can/internal/wake"
 )
 
 // ProbeWait is how long connect retries GET / when the peer is not yet reachable.
@@ -53,13 +54,23 @@ func (e env) cmdInvite(args []string) int {
 }
 
 func (e env) cmdConnect(ctx context.Context, args []string) int {
-	var label string
+	var label, wakeURL, wakeFile, wakeEnv, wakeLiteral string
 	var local, pullOnly bool
 	fs := newFlagSet("connect")
 	fs.StringVar(&label, "name", "", "local label for this contact")
 	fs.BoolVar(&local, "local", false, "allow a loopback peer URL")
 	fs.BoolVar(&pullOnly, "pull-only", false, "peer cannot accept push; they will fetch")
-	pos, help, err := parseWith(fs, args, map[string]bool{"name": true})
+	fs.StringVar(&wakeURL, "wake-url", "", "thaw webhook for a peer that sleeps when idle")
+	fs.StringVar(&wakeFile, "wake-token-file", "", "file containing the wake bearer token")
+	fs.StringVar(&wakeEnv, "wake-token-env", "", "environment variable holding the wake bearer token")
+	fs.StringVar(&wakeLiteral, "wake-token", "", "wake bearer token (stored in shell history; prefer --wake-token-file or --wake-token-env)")
+	pos, help, err := parseWith(fs, args, map[string]bool{
+		"name":            true,
+		"wake-url":        true,
+		"wake-token-file": true,
+		"wake-token-env":  true,
+		"wake-token":      true,
+	})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("connect"))
 		return 0
@@ -85,7 +96,7 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 		}
 		rawURL = pos[1]
 	default:
-		return e.fail(fmt.Errorf("usage: string-can connect <url> [--name <label>] [--local] [--pull-only]"))
+		return e.fail(fmt.Errorf("usage: string-can connect <url> [--name <label>] [--local] [--pull-only] [--wake-url <url>]"))
 	}
 	var baseURL, stated string
 	reachable := false
@@ -124,6 +135,21 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 			label = canon.ShortKey(key)
 		}
 	}
+	wakeSet := wakeURL != "" || wakeFile != "" || wakeEnv != "" || wakeLiteral != ""
+	var wakeNormalized, wakeToken, wakeWarning string
+	if wakeSet {
+		if wakeURL == "" {
+			return e.fail(fmt.Errorf("--wake-token-file, --wake-token-env, and --wake-token require --wake-url"))
+		}
+		wakeNormalized, err = wake.NormalizeURL(wakeURL)
+		if err != nil {
+			return e.fail(err)
+		}
+		wakeToken, wakeWarning, err = wake.LoadToken(wakeFile, wakeEnv, wakeLiteral)
+		if err != nil {
+			return e.fail(err)
+		}
+	}
 	st, dir, err := openStore()
 	if err != nil {
 		return e.fail(err)
@@ -139,6 +165,22 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 	if err := st.UpsertContact(c); err != nil {
 		return e.fail(err)
 	}
+	if wakeSet {
+		if wakeFile == "" && wakeEnv == "" && wakeLiteral == "" {
+			if _, existing, lerr := st.LoadWake(key); lerr == nil {
+				wakeToken = existing
+			}
+		}
+		if wakeWarning != "" {
+			fmt.Fprintln(e.stderr, "string-can: "+wakeWarning)
+		}
+		if err := st.SetWake(key, wakeNormalized, wakeToken); err != nil {
+			return e.fail(err)
+		}
+	}
+	if saved, gerr := st.GetContact(key); gerr == nil {
+		c = saved
+	}
 	if pullOnly {
 		fmt.Fprintln(e.stderr, "string-can: saved as pull-only; they will fetch, we will not push")
 	}
@@ -147,13 +189,7 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 	} else if !pullOnly {
 		fmt.Fprintln(e.stderr, "string-can: saved; delivery will retry")
 	}
-	return e.writeJSON(contactJSON{
-		Label:      c.Label,
-		PublicKey:  c.PublicKey,
-		BaseURL:    c.BaseURL,
-		StatedName: c.StatedName,
-		PullOnly:   c.PullOnly,
-	})
+	return e.writeJSON(viewContact(c))
 }
 
 func (e env) tryHandshake(ctx context.Context, dir home.Dir, peerURL string) {

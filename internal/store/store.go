@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -21,6 +22,8 @@ const messageCols = `id, peer_pubkey, from_pubkey, ts, text, body, signature, de
 const StateUnconfirmed = "unconfirmed"
 
 // Contact is a saved peer.
+// The wake bearer token is not on this struct. LoadWake reads it, and only
+// the wake POST uses it.
 type Contact struct {
 	PublicKey  string
 	Label      string
@@ -28,6 +31,10 @@ type Contact struct {
 	StatedName string
 	PullOnly   bool
 	CreatedAt  int64
+	// WakeURL is the peer's thaw webhook. Empty means unset.
+	WakeURL string
+	// WakeTokenSet is true when a bearer token is stored for WakeURL.
+	WakeTokenSet bool
 }
 
 // Message is a stored thread row.
@@ -79,7 +86,10 @@ CREATE TABLE IF NOT EXISTS contacts (
 	base_url TEXT NOT NULL,
 	stated_name TEXT NOT NULL,
 	created_at INTEGER NOT NULL,
-	pull_only INTEGER NOT NULL DEFAULT 0
+	pull_only INTEGER NOT NULL DEFAULT 0,
+	wake_url TEXT NOT NULL DEFAULT '',
+	wake_token TEXT NOT NULL DEFAULT '',
+	wake_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +116,11 @@ CREATE TABLE IF NOT EXISTS messages (
 		return nil, err
 	}
 	if err := migrateContacts(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// The wake token lives in this file. Keep it private to the owner.
+	if err := os.Chmod(path, 0o600); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -158,30 +173,26 @@ func columnSet(db *sql.DB, table string) (map[string]bool, error) {
 }
 
 func migrateContacts(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(contacts)`)
+	cols, err := columnSet(db, "contacts")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	hasPullOnly := false
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+	alters := []struct {
+		name string
+		sql  string
+	}{
+		{"pull_only", `ALTER TABLE contacts ADD COLUMN pull_only INTEGER NOT NULL DEFAULT 0`},
+		{"wake_url", `ALTER TABLE contacts ADD COLUMN wake_url TEXT NOT NULL DEFAULT ''`},
+		{"wake_token", `ALTER TABLE contacts ADD COLUMN wake_token TEXT NOT NULL DEFAULT ''`},
+		{"wake_at", `ALTER TABLE contacts ADD COLUMN wake_at INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, alt := range alters {
+		if cols[alt.name] {
+			continue
+		}
+		if _, err := db.Exec(alt.sql); err != nil {
 			return err
 		}
-		if name == "pull_only" {
-			hasPullOnly = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if !hasPullOnly {
-		_, err = db.Exec(`ALTER TABLE contacts ADD COLUMN pull_only INTEGER NOT NULL DEFAULT 0`)
-		return err
 	}
 	return nil
 }
@@ -223,18 +234,22 @@ ON CONFLICT(public_key) DO UPDATE SET
 	return err
 }
 
+const contactCols = `public_key, label, base_url, stated_name, created_at, pull_only, wake_url, CASE WHEN wake_token != '' THEN 1 ELSE 0 END`
+
 // GetContact loads a contact by public key.
+// It reports whether a wake token is stored and does not return the token.
 func (s *Store) GetContact(pub string) (Contact, error) {
 	var c Contact
-	var pullOnly int
+	var pullOnly, tokenSet int
 	err := s.db.QueryRow(`
-SELECT public_key, label, base_url, stated_name, created_at, pull_only
+SELECT `+contactCols+`
 FROM contacts WHERE public_key = ?
-`, pub).Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly)
+`, pub).Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly, &c.WakeURL, &tokenSet)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Contact{}, fmt.Errorf("not a contact")
 	}
 	c.PullOnly = pullOnly != 0
+	c.WakeTokenSet = tokenSet != 0
 	return c, err
 }
 
@@ -246,9 +261,10 @@ func (s *Store) IsContact(pub string) (bool, error) {
 }
 
 // ListContacts returns contacts oldest first.
+// Wake tokens are not loaded.
 func (s *Store) ListContacts() ([]Contact, error) {
 	rows, err := s.db.Query(`
-SELECT public_key, label, base_url, stated_name, created_at, pull_only
+SELECT ` + contactCols + `
 FROM contacts ORDER BY created_at ASC, public_key ASC
 `)
 	if err != nil {
@@ -258,14 +274,88 @@ FROM contacts ORDER BY created_at ASC, public_key ASC
 	var out []Contact
 	for rows.Next() {
 		var c Contact
-		var pullOnly int
-		if err := rows.Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly); err != nil {
+		var pullOnly, tokenSet int
+		if err := rows.Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly, &c.WakeURL, &tokenSet); err != nil {
 			return nil, err
 		}
 		c.PullOnly = pullOnly != 0
+		c.WakeTokenSet = tokenSet != 0
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// SetWake stores a thaw webhook for a contact. token may be empty.
+// It clears the rate-limit timestamp so the next failure can wake immediately.
+func (s *Store) SetWake(pub, url, token string) error {
+	res, err := s.db.Exec(`
+UPDATE contacts SET wake_url = ?, wake_token = ?, wake_at = 0 WHERE public_key = ?
+`, url, token, pub)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("not a contact")
+	}
+	return nil
+}
+
+// ClearWake removes the thaw webhook, token, and rate-limit timestamp.
+func (s *Store) ClearWake(pub string) error {
+	res, err := s.db.Exec(`
+UPDATE contacts SET wake_url = '', wake_token = '', wake_at = 0 WHERE public_key = ?
+`, pub)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("not a contact")
+	}
+	return nil
+}
+
+// LoadWake returns the stored webhook URL and bearer token.
+// Callers must not log the token.
+func (s *Store) LoadWake(pub string) (url, token string, err error) {
+	err = s.db.QueryRow(`SELECT wake_url, wake_token FROM contacts WHERE public_key = ?`, pub).Scan(&url, &token)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", fmt.Errorf("not a contact")
+	}
+	return url, token, err
+}
+
+// ClaimWake records a wake attempt if none was recorded within minInterval
+// (milliseconds) before now (unix milliseconds). The token is not read.
+// false means the contact has no wake URL or the interval has not elapsed.
+func (s *Store) ClaimWake(pub string, nowMs, minIntervalMs int64) (bool, error) {
+	if minIntervalMs < 0 {
+		minIntervalMs = 0
+	}
+	cutoff := nowMs - minIntervalMs
+	if minIntervalMs > nowMs {
+		cutoff = 0
+	}
+	res, err := s.db.Exec(`
+UPDATE contacts
+SET wake_at = ?
+WHERE public_key = ? AND wake_url != '' AND wake_at <= ?
+`, nowMs, pub, cutoff)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // RenameContact changes only the local label.

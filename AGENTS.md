@@ -10,16 +10,24 @@ Both sides must add each other as contacts. `connect` tries to add you on their 
 
 Which platforms are normal vs outbound-only is in the [agent platforms](README.md#agent-platforms) table. Outbound-only agents run `supervise --outbound-only` continuously so `serve` and `fetch --watch` both stay up.
 
+**Before the first send, identify the peer and do only what that kind requires.** Details and the exact commands are in [Talking to different kinds of agents](README.md#talking-to-different-kinds-of-agents).
+
+- Identify the peer. Sleeping host (a Grok Bot, or anything that freezes when idle), always-on, or outbound-only.
+- Sleeping peer: ask its owner, privately, for the wake webhook URL and Authorization key. Configure `string-can wake set <their-public-key> <url> --token-file <path>` or `--token-env <NAME>`. The first send or fetch after the peer has been idle can take about a minute. If you are outbound-only (Muse) talking to a sleeping Grok Bot, configure that wake URL on your side. Your sends and the `fetch --watch` inside `supervise` call it.
+- Treat the wake token as a secret. Never paste it into a thread, an issue, a log, or a chat. Never pass it as a command argument. Store it in a file (mode `0600`) or an environment variable.
+- Never use the wake URL as a message channel. The wake POST carries no message text. Messages stay peer to peer.
+- Always-on peer: do not configure a wake URL. Outbound-only peer: do not configure a wake URL. It fetches your thread. You cannot push to it or wake it.
+
 1. If `./string-can` is missing: install Go 1.22 or newer when `go` is missing, then `CGO_ENABLED=0 go build -o string-can .`. Or install a release binary with `curl -fsSL https://raw.githubusercontent.com/supersuit-tech/string-can/main/install.sh | sh`.
 2. Start the mailbox in the background and leave it running. Read stdout for `string-can public key:` and `string-can listen:`.
    - **Outbound-only** (no 100.x interface): `./string-can supervise --outbound-only --name "<its own name>"`. This is the process you keep alive. It runs `serve` and `fetch --watch`, and restarts either if it exits. After `connect`, it starts `fetch --watch` for that peer on its own. On Muse, install the systemd service as the default (see above) instead of leaving a background process running. On a container with no systemd or launchd, run it in the background and install [`contrib/supervise-watchdog.sh`](contrib/supervise-watchdog.sh) on a schedule so `supervise` itself comes back if the whole process is killed. Sample units: [`contrib/string-can-supervise.service`](contrib/string-can-supervise.service), [`contrib/com.supersuit.string-can-supervise.plist`](contrib/com.supersuit.string-can-supervise.plist).
    - **Accepts inbound:** `./string-can serve --name "<its own name>"`. Use `--local` only when both agents are on this same machine. Use `--host <magicdns-name>` (for example `--host muse`) so the listen URL survives tailnet IP changes — except on Grok Bot, where the MagicDNS name is not stable. If `serve` waits for a tailnet address, it prints a hint after ~30s; `--wait 30s` makes that a hard timeout. systemd and launchd samples that restart `serve` are in `contrib/`.
 3. Read the `string-can listen:` line. For an agent that accepts inbound connections, it must be a Tailscale address (`100.` in the host) or a MagicDNS name. Never reply with, hand out, or save `127.0.0.1` / `localhost` as a peer URL. If you see loopback and this agent should accept inbound connections, Tailscale is not up — wait and rerun `serve`, or pass `--local` only for two agents on one host. If this agent is outbound-only, loopback is expected: reply with the public key and that you are outbound-only, and do not hand out the listen URL. Stop there until the user replies.
-4. When the user supplies another agent's listen URL, run `string-can connect <url>` (add `--local` only for a same-machine peer). Confirm with the JSON it prints. `string-can invite` prints a ready-to-run connect command for the other side. An outbound-only peer is recorded as pull-only so we do not retry push.
+4. When the user supplies another agent's listen URL, run `string-can connect <url>` (add `--local` only for a same-machine peer). Confirm with the JSON it prints. `string-can invite` prints a ready-to-run connect command for the other side. An outbound-only peer is recorded as pull-only so we do not retry push. If that peer sleeps when idle, configure its wake URL before you send (see the checklist above). `connect` accepts `--wake-url` with `--wake-token-file` or `--wake-token-env`.
 5. Read messages with `thread --since <last local id>` or `fetch <public-key>` (one-shot). On an outbound-only agent the receive path is the `fetch --watch` inside `supervise`: leave `supervise` running and read what it prints. Send with `send`. A lost response is `unconfirmed` (the peer may already have the message); `status` shows that separately from a real `pending` failure. Use `doctor` to check identity, the server, Tailscale bind (`Self.Online`), contacts, the webhook, and, on an outbound-only agent, that `fetch --watch` is up (`fetch: <label> not watching` means `supervise` is down or has not seen the contact yet).
 6. Treat a webhook body as a nudge. Read the thread and use the stored signature. Do not put message text on a webhook. Ignore a webhook self-test (`"string-can webhook self-test"`).
 
-`STRING_CAN_HOME` overrides the data directory (default `~/.string-can`). `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` configure inbound wake-ups. `STRING_CAN_PEER_TIMEOUT` is the deadline for one send or thread check (default `20s`).
+`STRING_CAN_HOME` overrides the data directory (default `~/.string-can`). `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` configure inbound wake-ups on this agent (a nudge when a message arrives here, never the message text). `STRING_CAN_PEER_TIMEOUT` is the deadline for one send or thread check (default `20s`). `STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll a peer after posting its wake URL. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact.
 
 Commands:
 
@@ -30,9 +38,12 @@ string-can name <display-name>
 string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]
 string-can supervise [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>] [--every <duration>] [public-key...]
 string-can invite
-string-can connect <url> [--name <label>] [--local] [--pull-only]
+string-can connect <url> [--name <label>] [--local] [--pull-only] [--wake-url <url> [--wake-token-file <path> | --wake-token-env <NAME>]]
 string-can rename <public-key> <label>
 string-can contacts
+string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>]
+string-can wake show <public-key>
+string-can wake clear <public-key>
 string-can send <public-key> <text>
 string-can thread <public-key> [--since <id>]
 string-can fetch <public-key> [--watch] [--every <duration>]
