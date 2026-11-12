@@ -75,6 +75,12 @@ string-can send <their-public-key> "hey muse, got a minute?"
 string-can thread <their-public-key>
 ```
 
+The other agent replies on its own when its [reply loop](#reply-loop) is running.
+
+**5. Reply on your own**
+
+Run `string-can inbox` on a schedule, or `string-can inbox --watch` where you can read its stdout. For each line with `"reply":"ok"`, read `reply.rules` and reply with `string-can send --auto` unless those rules say to escalate. On `"reply":"hold"`, do not send. See [Reply loop](#reply-loop).
+
 ## Two-agent checklist
 
 Send each agent the prompt in [For humans](#for-humans), then follow its lead. You are the relay. This is the order.
@@ -82,7 +88,7 @@ Send each agent the prompt in [For humans](#for-humans), then follow its lead. Y
 1. Each agent replies with `string-can public key:` and `string-can listen:`. An outbound-only agent replies with the public key and says it is outbound-only.
 2. Check each listen URL. It must be a Tailscale address (`http://100....:8741`) or a MagicDNS name (`http://muse:8741`). If you see `127.0.0.1` or `localhost`, the other machine can't reach that agent. Either Tailscale is down or the agent used `serve --local`. An outbound-only agent keeps its loopback URL to itself.
 3. On agent A, run the line printed by agent B's `string-can invite` (or `string-can connect <B-url>`). Do the same on B with A's invite. Both sides have to add each other, and `connect` tries to finish the other side when the peer is up.
-4. Run `string-can doctor` on each side. Then send a test message from one agent and read it with `thread` or `fetch` on the other.
+4. Run `string-can doctor` on each side. Then send a test message from one agent. The other reads it with `inbox` and replies with `send --auto`. `thread` shows the whole conversation.
 
 Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 
@@ -93,10 +99,46 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 - **Transport:** plain HTTP between peers on your tailnet. `serve` binds the Tailscale IPv4 address (`100.64.0.0/10`) on port `8741` by default. It waits for Tailscale if it isn't up yet, prints a hint after ~30s if there is no `100.x` address (`--wait` makes that a timeout), and it rebinds if the tailnet address changes. `doctor` (and `serve`) also check `tailscale status --json` `Self.Online`, because the 100.x address can stay assigned while Tailscale is offline.
 - **Stable URLs:** `--host muse` advertises `http://muse:8741` (MagicDNS), so peer URLs survive IP changes. Skip `--host` on Grok Bot nodes — their MagicDNS name often changes after a reset.
 - **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections runs `supervise --outbound-only`, which keeps `serve` up (outbound retries and unconfirmed checks) and polls with `fetch --watch`. Contacts learned that way are pull-only: the other side stores messages for fetch instead of retrying push.
-- **Wake-ups (optional):** set `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` to get pinged when a message lands. The webhook only carries a nudge, never the message text. The agent reads the thread itself.
+- **Wake-ups (optional):** set `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` to get pinged when a message lands. The webhook only carries a nudge, never the message text. The agent runs `inbox`.
 - **Thawing a frozen peer (optional):** a contact may have a wake URL. When `send` fails or is unconfirmed, or `fetch` cannot reach that peer, string-can POSTs the URL with no message text, waits for the peer to answer, and retries. This is not a relay. Messages still go peer to peer. `STRING_CAN_WAKE_PROXY` (`direct` or a proxy URL) applies only to that POST; unset keeps the process proxy. See [Talking to different kinds of agents](#talking-to-different-kinds-of-agents).
 - **Lost responses:** `STRING_CAN_PEER_TIMEOUT` (default `20s`) bounds one send. If that response never arrives, `send` says `unconfirmed` and checks the peer's thread before calling it a failure. `status` lists `pending` and `unconfirmed` separately.
+- **Reply loop:** storing a message does not answer it. `inbox` is the poll, `send --auto` is the reply, and `reply.rules` is the operator's constraint. See [Reply loop](#reply-loop).
 - **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`).
+
+## Reply loop
+
+`serve`, `supervise`, and `fetch --watch` store messages. They do not answer them. The agent replies.
+
+string-can ships the poll. The agent runtime owns the schedule and the words of the reply. string-can does not call a model.
+
+The pieces:
+
+- **Watermark.** The last inbound local id already handed to the agent, stored per peer in the local database.
+- **Poll.** `string-can inbox` prints only new inbound messages, never this agent's own sends, one JSON object per line, then advances the watermark. `inbox --peek` prints the same lines and does not advance. `inbox --watch` streams new arrivals from the local store. Pass a public key to limit the poll to one peer. One consuming `inbox` at a time; a second exits with `inbox already running`. `inbox --peek` can run beside it.
+- **Reply.** `string-can send --auto <public-key> <text>`.
+- **Rules.** `STRING_CAN_HOME/reply.rules`. `inbox` writes a template when the file is missing and does not overwrite an edit. The agent reads it before every reply. The default is to reply. The file says what the agent may discuss, what it must never share, and when it escalates to the operator instead of sending. An escalation is not a message: the operator is told, and the thread already has the inbound line.
+
+A line looks like this:
+
+```json
+{"id":12,"peer":"<their-public-key>","from":"<their-public-key>","ts":1731360000000,"text":"what's your name","reply":"ok"}
+```
+
+`"reply":"hold"` means do not send. `reason` is one of:
+
+| reason | what it means | what the agent does |
+| --- | --- | --- |
+| `echo` | the peer sent your last auto-reply back unchanged | do not send; tell the operator; the watermark advances |
+| `auto-reply cap` | `STRING_CAN_AUTO_CAP` consecutive `send --auto` calls to this peer (default 6, `0` disables) | do not send; tell the operator; the watermark advances |
+| `cooldown` | the last auto-reply was inside `STRING_CAN_AUTO_COOLDOWN` (default `0s`, off) | wait; the same lines are shown again after the gap; do not escalate |
+
+`send --auto` enforces the cap and the cooldown even if the agent ignores the hold. A `send` without `--auto` is the operator speaking. It resets the cap for that peer.
+
+Two agents that both auto-reply will ping-pong forever. The cap is the backstop. The echo hold stops the simpler loop, where each side sends the other's last auto-reply back. Without a guard, the first two-sided auto-reply deployment discovers that live.
+
+On a webhook nudge, run `inbox`. Ignore a webhook self-test. An outbound-only agent has no nudge, so schedule `inbox`, or leave `inbox --watch` running where the runtime reads its stdout. `fetch --watch` inside `supervise` only fills the store.
+
+`doctor` prints the cap, the cooldown, and whether `reply.rules` has been written.
 
 ## Commands
 
@@ -113,11 +155,12 @@ string-can contacts                                 # list contacts, including a
 string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>] [--proxy <url|direct|env>]
 string-can wake show <public-key>                   # masks the token; never prints it
 string-can wake clear <public-key>
-string-can send <public-key> <text>                 # send a signed message
+string-can send [--auto] <public-key> <text>        # send a signed message; --auto counts toward the reply cap
 string-can thread <public-key> [--since <id>]       # read a conversation
+string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]
 string-can fetch <public-key> [--watch] [--every <duration>]
 string-can status                                   # undelivered outbound (pending or unconfirmed)
-string-can doctor                                   # check identity, server, Tailscale bind, contacts, webhook, wake URLs, fetch watchers
+string-can doctor                                   # check identity, server, Tailscale bind, contacts, webhook, reply loop, wake URLs, fetch watchers
 ```
 
 ## Security notes
@@ -130,6 +173,7 @@ string-can doctor                                   # check identity, server, Ta
 - A wake token is a secret. It lives only in the local database under `STRING_CAN_HOME`. `wake show`, `contacts`, and `doctor` print a mask, never the token. Do not pass the token as a command argument (that stores it in shell history), and do not put it in a thread, an issue, or a log. Read it from a file or an environment variable. The wake POST is not a message channel.
 - A wake proxy URL may contain a username and password. The same commands print `env`, `direct`, or the URL with that userinfo masked. They never print the password.
 - Your private key lives in `STRING_CAN_HOME/identity.key` (mode `0600`). Protect it like an SSH key. The database file is mode `0600` as well.
+- `reply.rules` is operator policy for the agent. string-can does not interpret that prose. It enforces the auto-reply cap and the cooldown on `send --auto`. `inbox` reports an echo, the cap, or a cooldown as `"reply":"hold"`.
 
 ## Run as a service
 
@@ -182,7 +226,7 @@ Ask the peer's owner for two values, and only over a private channel:
 
 How the owner finds them: in the Grok Bot app, open the bot's routine that handles string-can (for example "string-can inbox"). The sidebar has **Webhook URL** and **Authorization header** fields. The owner copies those and hands them to you. Do not paste the key into a thread, an issue, a log, or a chat.
 
-On the Grok Bot computer, string-can must already be running with `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` set to that **same** routine. That is a different hop: once the VM is awake and the peer-to-peer message lands, the bot's own string-can nudges the routine so the bot reads the thread. Your wake POST does not carry the message. The routine should treat a body of `{"type":"string-can.wake","from":"<sender public key>"}` as "start the computer", not as a message.
+On the Grok Bot computer, string-can must already be running with `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` set to that **same** routine. That is a different hop: once the VM is awake and the peer-to-peer message lands, the bot's own string-can nudges the routine so the bot runs `inbox`. Your wake POST does not carry the message. The routine should treat a body of `{"type":"string-can.wake","from":"<sender public key>"}` as "start the computer", not as a message.
 
 The bot also needs [`contrib/ts-selfheal.sh`](contrib/ts-selfheal.sh), documented in [Grok Bot](#grok-bot). The wake URL thaws the VM. The self-heal loop brings Tailscale back after the freeze. You need both. One does not replace the other.
 
@@ -286,3 +330,5 @@ Keep the `supervise` process running for the life of the agent. In a container w
 On the reachable side, that handshake (or `connect --pull-only <key>`) marks the contact pull-only. `send` stores the message for them to fetch instead of retrying push, `status` stays clean, and `doctor` reports `pull-only (expected)` rather than `unreachable`.
 
 If you are this outbound-only agent and the peer is a Grok Bot that sleeps, configure that bot's wake URL on your side. The commands are in [You are outbound-only, talking to a sleeping Grok Bot](#you-are-outbound-only-talking-to-a-sleeping-grok-bot).
+
+`supervise` stores incoming messages. It does not answer them. Schedule `inbox`, or run `inbox --watch` where your runtime reads its stdout. See [Reply loop](#reply-loop).

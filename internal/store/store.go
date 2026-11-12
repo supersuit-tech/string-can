@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS messages (
 	next_attempt INTEGER NOT NULL DEFAULT 0,
 	UNIQUE(peer_pubkey, signature)
 );
+CREATE TABLE IF NOT EXISTS inbox (
+	peer_pubkey TEXT PRIMARY KEY,
+	watermark INTEGER NOT NULL DEFAULT 0,
+	auto_streak INTEGER NOT NULL DEFAULT 0,
+	auto_at INTEGER NOT NULL DEFAULT 0,
+	auto_text TEXT NOT NULL DEFAULT ''
+);
 `); err != nil {
 		db.Close()
 		return nil, err
@@ -549,6 +556,93 @@ func (s *Store) CountUnconfirmed() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE delivered = 0 AND delivery_state = ?`, StateUnconfirmed).Scan(&n)
 	return n, err
+}
+
+// Inbox is the per-peer reply-loop cursor.
+// Watermark is the last inbound local id already handed to the agent.
+// AutoStreak counts consecutive send --auto calls since an operator send.
+// AutoAt is the unix-milli time of the last auto-reply. AutoText is that text.
+type Inbox struct {
+	Watermark  int64
+	AutoStreak int
+	AutoAt     int64
+	AutoText   string
+}
+
+// InboxState returns the cursor for peer. A missing row is a zero cursor.
+func (s *Store) InboxState(peer string) (Inbox, error) {
+	var in Inbox
+	err := s.db.QueryRow(`
+SELECT watermark, auto_streak, auto_at, auto_text FROM inbox WHERE peer_pubkey = ?
+`, peer).Scan(&in.Watermark, &in.AutoStreak, &in.AutoAt, &in.AutoText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Inbox{}, nil
+	}
+	return in, err
+}
+
+// SetWatermark records the last inbound id handed to the agent.
+// It never moves the watermark backward.
+func (s *Store) SetWatermark(peer string, id int64) error {
+	_, err := s.db.Exec(`
+INSERT INTO inbox (peer_pubkey, watermark, auto_streak, auto_at, auto_text)
+VALUES (?, ?, 0, 0, '')
+ON CONFLICT(peer_pubkey) DO UPDATE SET watermark = MAX(watermark, excluded.watermark)
+`, peer, id)
+	return err
+}
+
+// RecordAutoSend counts one send --auto and remembers its text.
+func (s *Store) RecordAutoSend(peer, text string, nowMs int64) error {
+	_, err := s.db.Exec(`
+INSERT INTO inbox (peer_pubkey, watermark, auto_streak, auto_at, auto_text)
+VALUES (?, 0, 1, ?, ?)
+ON CONFLICT(peer_pubkey) DO UPDATE SET
+	auto_streak = auto_streak + 1,
+	auto_at = excluded.auto_at,
+	auto_text = excluded.auto_text
+`, peer, nowMs, text)
+	return err
+}
+
+// ResetAuto clears the auto-reply streak. An operator send calls this.
+func (s *Store) ResetAuto(peer string) error {
+	_, err := s.db.Exec(`
+INSERT INTO inbox (peer_pubkey, watermark, auto_streak, auto_at, auto_text)
+VALUES (?, 0, 0, 0, '')
+ON CONFLICT(peer_pubkey) DO UPDATE SET
+	auto_streak = 0,
+	auto_at = 0,
+	auto_text = ''
+`, peer)
+	return err
+}
+
+// InboundSince returns verified messages this peer sent us with id > since.
+// Our own sends are excluded: those rows have from_pubkey equal to us, not the peer.
+func (s *Store) InboundSince(peer string, since int64) ([]Message, error) {
+	rows, err := s.db.Query(`
+SELECT `+messageCols+`
+FROM messages
+WHERE peer_pubkey = ? AND from_pubkey = ? AND id > ?
+ORDER BY id ASC
+`, peer, peer, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	msgs, err := scanMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+	var out []Message
+	for _, m := range msgs {
+		if err := canon.Verify(m.FromPub, []byte(m.Body), m.Signature); err != nil {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, nil
 }
 
 func scanMessages(rows *sql.Rows) ([]Message, error) {
