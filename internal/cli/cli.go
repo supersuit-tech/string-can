@@ -18,6 +18,7 @@ import (
 	"github.com/supersuit-tech/string-can/internal/push"
 	"github.com/supersuit-tech/string-can/internal/server"
 	"github.com/supersuit-tech/string-can/internal/store"
+	"github.com/supersuit-tech/string-can/internal/wake"
 )
 
 const usage = `string-can — signed messages between agents
@@ -32,11 +33,14 @@ Usage:
   string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]
   string-can supervise [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>] [--every <duration>] [public-key...]
   string-can invite
-  string-can connect <url> [--name <label>] [--local] [--pull-only]
-  string-can connect <public-key> <base-url> [--name <label>] [--local] [--pull-only]
+  string-can connect <url> [--name <label>] [--local] [--pull-only] [--wake-url <url> [--wake-token-file <path> | --wake-token-env <NAME> | --wake-token <literal>]]
+  string-can connect <public-key> <base-url> [--name <label>] [--local] [--pull-only] [--wake-url <url> [--wake-token-file <path> | --wake-token-env <NAME> | --wake-token <literal>]]
   string-can connect --pull-only <public-key> [--name <label>]
   string-can rename <public-key> <label>
   string-can contacts
+  string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>]
+  string-can wake show <public-key>
+  string-can wake clear <public-key>
   string-can send <public-key> <text>
   string-can thread <public-key> [--since <id>]
   string-can fetch <public-key> [--watch] [--every <duration>]
@@ -45,9 +49,12 @@ Usage:
 
 Environment:
   STRING_CAN_HOME            data directory (default ~/.string-can)
-  STRING_CAN_WEBHOOK_URL     POST target for inbound wake-ups
-  STRING_CAN_WEBHOOK_TOKEN   Bearer token for the webhook
+  STRING_CAN_WEBHOOK_URL     POST target when a message arrives here
+  STRING_CAN_WEBHOOK_TOKEN   Bearer token for that inbound webhook
   STRING_CAN_PEER_TIMEOUT    deadline for one send or thread check (default 20s)
+  STRING_CAN_WAKE_WAIT       how long to poll a peer after waking it (default 60s)
+  STRING_CAN_WAKE_INTERVAL   minimum gap between wakes of one contact (default 2m)
+  STRING_CAN_WAKE_POLL       pause between those health checks (default 1s)
 `
 
 type env struct {
@@ -92,6 +99,8 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return e.cmdRename(rest)
 	case "contacts":
 		return e.cmdContacts(rest)
+	case "wake":
+		return e.cmdWake(rest)
 	case "send":
 		return e.cmdSend(ctx, rest)
 	case "thread":
@@ -297,13 +306,7 @@ func (e env) cmdRename(args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
-	return e.writeJSON(contactJSON{
-		Label:      c.Label,
-		PublicKey:  c.PublicKey,
-		BaseURL:    c.BaseURL,
-		StatedName: c.StatedName,
-		PullOnly:   c.PullOnly,
-	})
+	return e.writeJSON(viewContact(c))
 }
 
 func (e env) cmdContacts(args []string) int {
@@ -323,13 +326,7 @@ func (e env) cmdContacts(args []string) int {
 		return e.fail(err)
 	}
 	for _, c := range list {
-		if err := e.writeJSON(struct {
-			PublicKey  string `json:"public_key"`
-			Label      string `json:"label"`
-			BaseURL    string `json:"base_url"`
-			StatedName string `json:"stated_name"`
-			PullOnly   bool   `json:"pull_only"`
-		}{c.PublicKey, c.Label, c.BaseURL, c.StatedName, c.PullOnly}); err != 0 {
+		if err := e.writeJSON(viewContact(c)); err != 0 {
 			return err
 		}
 	}
@@ -401,6 +398,13 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 		return 0
 	}
 	res := push.Deliver(ctx, push.PeerClient(), c.BaseURL, from, sig, body, push.DeliverOptions{})
+	if res.Kind != push.KindDelivered && c.WakeURL != "" && wake.SendNeedsWake(res.Kind, res.Err) {
+		if wake.Try(ctx, st, key, c.BaseURL, from, e.logf()) {
+			res = push.Deliver(ctx, push.PeerClient(), c.BaseURL, from, sig, body, push.DeliverOptions{
+				VerifyFirst: res.Kind == push.KindUnconfirmed,
+			})
+		}
+	}
 	switch res.Kind {
 	case push.KindDelivered:
 		if err := st.MarkDelivered(id); err != nil {
@@ -478,6 +482,30 @@ type contactJSON struct {
 	BaseURL    string `json:"base_url"`
 	StatedName string `json:"stated_name"`
 	PullOnly   bool   `json:"pull_only"`
+	WakeURL    string `json:"wake_url"`
+	WakeToken  string `json:"wake_token"`
+}
+
+func viewContact(c store.Contact) contactJSON {
+	token := ""
+	if c.WakeTokenSet {
+		token = wake.MaskedToken
+	}
+	return contactJSON{
+		Label:      c.Label,
+		PublicKey:  c.PublicKey,
+		BaseURL:    c.BaseURL,
+		StatedName: c.StatedName,
+		PullOnly:   c.PullOnly,
+		WakeURL:    wake.MaskURL(c.WakeURL),
+		WakeToken:  token,
+	}
+}
+
+func (e env) logf() func(string, ...any) {
+	return func(format string, args ...any) {
+		fmt.Fprintf(e.stderr, "string-can "+format+"\n", args...)
+	}
 }
 
 func (e env) writeJSON(v any) int {
@@ -598,11 +626,13 @@ func commandHelp(name string) string {
 	case "invite":
 		return "usage: string-can invite\n"
 	case "connect":
-		return "usage: string-can connect <url> [--name <label>] [--local] [--pull-only]\n       string-can connect <public-key> <base-url> [--name <label>] [--local] [--pull-only]\n       string-can connect --pull-only <public-key> [--name <label>]\n"
+		return "usage: string-can connect <url> [--name <label>] [--local] [--pull-only] [--wake-url <url> [--wake-token-file <path> | --wake-token-env <NAME> | --wake-token <literal>]]\n       string-can connect <public-key> <base-url> [--name <label>] [--local] [--pull-only] [--wake-url <url> [--wake-token-file <path> | --wake-token-env <NAME> | --wake-token <literal>]]\n       string-can connect --pull-only <public-key> [--name <label>]\n"
 	case "rename":
 		return "usage: string-can rename <public-key> <label>\n"
 	case "contacts":
 		return "usage: string-can contacts\n"
+	case "wake":
+		return "usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>]\n       string-can wake show <public-key>\n       string-can wake clear <public-key>\n"
 	case "send":
 		return "usage: string-can send <public-key> <text>\n"
 	case "thread":

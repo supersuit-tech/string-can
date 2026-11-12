@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/supersuit-tech/string-can/internal/listenaddr"
 	"github.com/supersuit-tech/string-can/internal/push"
 	"github.com/supersuit-tech/string-can/internal/store"
+	"github.com/supersuit-tech/string-can/internal/wake"
 )
 
 func (e env) cmdFetch(ctx context.Context, args []string) int {
@@ -73,7 +75,9 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 		defer lk.Unlock()
 	}
 	for {
-		n, code := e.fetchOnce(ctx, st, c.BaseURL, ourKey, key)
+		// supervise runs this loop as `fetch --watch`. A miss here is how
+		// an outbound-only agent notices a frozen peer and wakes it.
+		n, code := e.fetchOnce(ctx, st, c, ourKey)
 		if code != 0 && !watch {
 			return code
 		}
@@ -97,8 +101,14 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 	}
 }
 
-func (e env) fetchOnce(ctx context.Context, st *store.Store, baseURL, ourKey, key string) (int, int) {
-	remote, err := push.Thread(ctx, push.PeerClient(), baseURL, ourKey)
+func (e env) fetchOnce(ctx context.Context, st *store.Store, c store.Contact, ourKey string) (int, int) {
+	key := c.PublicKey
+	remote, err := push.Thread(ctx, push.PeerClient(), c.BaseURL, ourKey)
+	if err != nil && !c.PullOnly && c.WakeURL != "" && wake.FetchNeedsWake(err) {
+		if wake.Try(ctx, st, key, c.BaseURL, ourKey, e.logf()) {
+			remote, err = push.Thread(ctx, push.PeerClient(), c.BaseURL, ourKey)
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(e.stderr, "string-can: %v\n", err)
 		return 0, 1
@@ -280,44 +290,8 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 			fmt.Fprintf(e.stdout, "%s: remote URL while this server is on loopback\n", line)
 			ok = false
 		}
-		if c.PullOnly {
-			if c.BaseURL == "" {
-				fmt.Fprintf(e.stdout, "%s: pull-only (expected)\n", line)
-				continue
-			}
-			_, err := push.GetInfo(ctx, client, c.BaseURL)
-			if err != nil {
-				fmt.Fprintf(e.stdout, "%s: pull-only (expected)\n", line)
-				continue
-			}
-			fmt.Fprintf(e.stdout, "%s: reachable, pull-only (will not push)\n", line)
-			continue
-		}
-		info, err := push.GetInfo(ctx, client, c.BaseURL)
-		if err != nil {
-			fmt.Fprintf(e.stdout, "%s: unreachable (%v)\n", line, err)
-			ok = false
-			continue
-		}
-		got, nerr := canon.NormalizeKey(info.PublicKey)
-		if nerr != nil || got != c.PublicKey {
-			fmt.Fprintf(e.stdout, "%s: reachable, public key mismatch\n", line)
-			ok = false
-			continue
-		}
-		allowed, checked, err := push.Allow(ctx, client, c.BaseURL, ourKey)
-		switch {
-		case err != nil:
-			fmt.Fprintf(e.stdout, "%s: reachable, mutual check failed (%v)\n", line, err)
-			ok = false
-		case !checked:
-			fmt.Fprintf(e.stdout, "%s: reachable, mutual unknown\n", line)
-		case !allowed:
-			fmt.Fprintf(e.stdout, "%s: reachable, they have not added you; ask them to run connect with your URL\n", line)
-			ok = false
-		default:
-			fmt.Fprintf(e.stdout, "%s: reachable, mutual\n", line)
-		}
+		fmt.Fprintf(e.stdout, "%s: %s\n", line, contactStatus(ctx, client, c, ourKey, &ok))
+		fmt.Fprintf(e.stdout, "    %s\n", wakeStatus(c))
 	}
 	if dir.OutboundOnly() {
 		e.reportFetch(dir, contacts, &ok)
@@ -326,6 +300,52 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func contactStatus(ctx context.Context, client *http.Client, c store.Contact, ourKey string, ok *bool) string {
+	if c.PullOnly {
+		if c.BaseURL == "" {
+			return "pull-only (expected)"
+		}
+		if _, err := push.GetInfo(ctx, client, c.BaseURL); err != nil {
+			return "pull-only (expected)"
+		}
+		return "reachable, pull-only (will not push)"
+	}
+	info, err := push.GetInfo(ctx, client, c.BaseURL)
+	if err != nil {
+		*ok = false
+		return fmt.Sprintf("unreachable (%v)", err)
+	}
+	got, nerr := canon.NormalizeKey(info.PublicKey)
+	if nerr != nil || got != c.PublicKey {
+		*ok = false
+		return "reachable, public key mismatch"
+	}
+	allowed, checked, err := push.Allow(ctx, client, c.BaseURL, ourKey)
+	switch {
+	case err != nil:
+		*ok = false
+		return fmt.Sprintf("reachable, mutual check failed (%v)", err)
+	case !checked:
+		return "reachable, mutual unknown"
+	case !allowed:
+		*ok = false
+		return "reachable, they have not added you; ask them to run connect with your URL"
+	default:
+		return "reachable, mutual"
+	}
+}
+
+func wakeStatus(c store.Contact) string {
+	if c.WakeURL == "" {
+		return "wake: not set"
+	}
+	token := "(not set)"
+	if c.WakeTokenSet {
+		token = wake.MaskedToken
+	}
+	return fmt.Sprintf("wake: %s token %s", wake.MaskURL(c.WakeURL), token)
 }
 
 // reportFetch says whether fetch --watch is alive for each peer an

@@ -21,6 +21,7 @@ import (
 	"github.com/supersuit-tech/string-can/internal/listenaddr"
 	"github.com/supersuit-tech/string-can/internal/push"
 	"github.com/supersuit-tech/string-can/internal/store"
+	"github.com/supersuit-tech/string-can/internal/wake"
 )
 
 // Config is the serve-time configuration.
@@ -386,6 +387,15 @@ func (s *Server) retryOutbound(ctx context.Context) {
 		res := push.Deliver(ctx, s.peerClient, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body), push.DeliverOptions{
 			VerifyFirst: m.State == store.StateUnconfirmed,
 		})
+		// A frozen peer never answers. Thaw it, wait, and try this delivery once more.
+		// supervise's serve child runs this loop, so an outbound-only agent wakes here too.
+		if res.Kind != push.KindDelivered && c.WakeURL != "" && wake.SendNeedsWake(res.Kind, res.Err) {
+			if wake.Try(ctx, s.store, c.PublicKey, c.BaseURL, s.pub, s.log.Printf) {
+				res = push.Deliver(ctx, s.peerClient, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body), push.DeliverOptions{
+					VerifyFirst: res.Kind == push.KindUnconfirmed || m.State == store.StateUnconfirmed,
+				})
+			}
+		}
 		switch res.Kind {
 		case push.KindDelivered:
 			if err := s.store.MarkDelivered(m.ID); err != nil {

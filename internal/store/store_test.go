@@ -147,3 +147,119 @@ func TestPullOnlyClearsPending(t *testing.T) {
 		t.Fatalf("pending after pull-only %d %v", n, err)
 	}
 }
+
+func TestWakeStoredSeparatelyFromContact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "string-can.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	peer := strings.Repeat("ab", 32)
+	const (
+		token = "wake-token-should-not-leak"
+		url   = "https://hooks.example.com/v1/wake-token-should-not-leak"
+	)
+	if err := st.UpsertContact(Contact{PublicKey: peer, Label: "bot", BaseURL: "http://127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetWake(peer, url, token); err != nil {
+		t.Fatal(err)
+	}
+	c, err := st.GetContact(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.WakeURL != url || !c.WakeTokenSet {
+		t.Fatalf("contact wake fields: %+v", c)
+	}
+	if strings.Contains(c.Label+c.BaseURL+c.StatedName, token) {
+		t.Fatal("token copied onto a display field")
+	}
+	gotURL, gotToken, err := st.LoadWake(peer)
+	if err != nil || gotURL != url || gotToken != token {
+		t.Fatalf("load %q %q %v", gotURL, gotToken, err)
+	}
+	listed, err := st.ListContacts()
+	if err != nil || len(listed) != 1 || listed[0].WakeURL != url || !listed[0].WakeTokenSet {
+		t.Fatalf("list %+v %v", listed, err)
+	}
+	// Relabeling must not wipe the webhook or the token.
+	c.Label = "renamed"
+	if err := st.UpsertContact(c); err != nil {
+		t.Fatal(err)
+	}
+	gotURL, gotToken, err = st.LoadWake(peer)
+	if err != nil || gotURL != url || gotToken != token {
+		t.Fatalf("upsert wiped wake %q %q %v", gotURL, gotToken, err)
+	}
+	if err := st.ClearWake(peer); err != nil {
+		t.Fatal(err)
+	}
+	c, err = st.GetContact(peer)
+	if err != nil || c.WakeURL != "" || c.WakeTokenSet {
+		t.Fatalf("after clear %+v %v", c, err)
+	}
+	if _, gotToken, err = st.LoadWake(peer); err != nil || gotToken != "" {
+		t.Fatalf("token remained %q %v", gotToken, err)
+	}
+}
+
+func TestWakeMigrationAndRateLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := strings.Repeat("cd", 32)
+	if _, err := db.Exec(`
+CREATE TABLE contacts (
+	public_key TEXT PRIMARY KEY,
+	label TEXT NOT NULL,
+	base_url TEXT NOT NULL,
+	stated_name TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	pull_only INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO contacts (public_key, label, base_url, stated_name, created_at, pull_only)
+VALUES (?, 'bot', 'http://127.0.0.1:1', 'bot', 1, 0)
+`, peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c, err := st.GetContact(peer)
+	if err != nil || c.WakeURL != "" || c.WakeTokenSet {
+		t.Fatalf("migrated %+v %v", c, err)
+	}
+	if err := st.SetWake(peer, "https://hooks.example.com/wake", "sekrit"); err != nil {
+		t.Fatal(err)
+	}
+	const interval int64 = 120_000
+	now := int64(1_000_000)
+	claimed, err := st.ClaimWake(peer, now, interval)
+	if err != nil || !claimed {
+		t.Fatalf("first claim %v %v", claimed, err)
+	}
+	claimed, err = st.ClaimWake(peer, now+interval-1, interval)
+	if err != nil || claimed {
+		t.Fatalf("early claim %v %v", claimed, err)
+	}
+	claimed, err = st.ClaimWake(peer, now+interval, interval)
+	if err != nil || !claimed {
+		t.Fatalf("boundary claim %v %v", claimed, err)
+	}
+	if err := st.ClearWake(peer); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = st.ClaimWake(peer, now+interval*2, interval)
+	if err != nil || claimed {
+		t.Fatalf("claim without url %v %v", claimed, err)
+	}
+}
