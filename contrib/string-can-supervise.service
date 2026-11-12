@@ -9,7 +9,8 @@ Type=simple
 # Do not enable contrib/string-can.service at the same time (two serves conflict).
 # Add --name <display-name> and, to watch only some peers, their public keys.
 ExecStart=/usr/local/bin/string-can supervise --outbound-only
-Restart=on-failure
+# supervise exits 0 on SIGTERM, so on-failure would not bring it back. Always restart.
+Restart=always
 RestartSec=5
 Environment=STRING_CAN_HOME=%h/.string-can
 # Environment=STRING_CAN_WEBHOOK_URL=
