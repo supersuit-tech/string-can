@@ -121,9 +121,21 @@ func IsLoopbackURL(baseURL string) bool {
 	return IsLoopbackHost(HostOf(baseURL))
 }
 
+// HintAfter is how long WaitForTailscale waits before suggesting --local or
+// --outbound-only. Tests may shorten this.
+var HintAfter = 30 * time.Second
+
+// NoTailnetHint is printed once after HintAfter while still waiting for 100.x.
+const NoTailnetHint = "no tailnet interface found; use --local + fetch if this agent is outbound-only"
+
+// ErrNoTailscale is returned when WaitForTailscale times out or is cancelled
+// without finding a 100.x address.
+var ErrNoTailscale = fmt.Errorf("no Tailscale IPv4 address; pass --local to bind to 127.0.0.1, or --outbound-only if this agent will poll with fetch")
+
 // WaitForTailscale blocks until a Tailscale IPv4 address appears, ctx is done,
 // or wait elapses (wait <= 0 means until ctx is done). onWait is called when
-// waiting starts and on each interval tick while still waiting.
+// waiting starts and on each interval tick while still waiting. After HintAfter
+// it also emits NoTailnetHint once.
 func WaitForTailscale(ctx context.Context, wait, interval time.Duration, onWait func(string)) (string, error) {
 	if ip, ok := TailscaleIPv4(); ok {
 		return ip, nil
@@ -140,6 +152,17 @@ func WaitForTailscale(ctx context.Context, wait, interval time.Duration, onWait 
 		waitCtx, cancel = context.WithTimeout(ctx, wait)
 		defer cancel()
 	}
+	start := time.Now()
+	hinted := false
+	maybeHint := func() {
+		if hinted || HintAfter <= 0 || onWait == nil {
+			return
+		}
+		if time.Since(start) >= HintAfter {
+			hinted = true
+			onWait(NoTailnetHint)
+		}
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -148,7 +171,7 @@ func WaitForTailscale(ctx context.Context, wait, interval time.Duration, onWait 
 			if ip, ok := TailscaleIPv4(); ok {
 				return ip, nil
 			}
-			return "", fmt.Errorf("no Tailscale IPv4 address; pass --local to bind to 127.0.0.1")
+			return "", ErrNoTailscale
 		case <-ticker.C:
 			if ip, ok := TailscaleIPv4(); ok {
 				return ip, nil
@@ -156,6 +179,7 @@ func WaitForTailscale(ctx context.Context, wait, interval time.Duration, onWait 
 			if onWait != nil {
 				onWait("still waiting for Tailscale IPv4 in 100.64.0.0/10")
 			}
+			maybeHint()
 		}
 	}
 }

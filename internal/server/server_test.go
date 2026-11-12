@@ -447,9 +447,10 @@ func getThread(t *testing.T, base, peer string) []threadMsg {
 }
 
 func getInfo(t *testing.T, base string) struct {
-	V         int    `json:"v"`
-	Name      string `json:"name"`
-	PublicKey string `json:"public_key"`
+	V            int    `json:"v"`
+	Name         string `json:"name"`
+	PublicKey    string `json:"public_key"`
+	OutboundOnly bool   `json:"outbound_only"`
 } {
 	t.Helper()
 	resp, err := http.Get(strings.TrimRight(base, "/") + "/")
@@ -458,9 +459,10 @@ func getInfo(t *testing.T, base string) struct {
 	}
 	defer resp.Body.Close()
 	var info struct {
-		V         int    `json:"v"`
-		Name      string `json:"name"`
-		PublicKey string `json:"public_key"`
+		V            int    `json:"v"`
+		Name         string `json:"name"`
+		PublicKey    string `json:"public_key"`
+		OutboundOnly bool   `json:"outbound_only"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		t.Fatal(err)

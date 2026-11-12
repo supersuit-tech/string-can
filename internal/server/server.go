@@ -30,6 +30,7 @@ type Config struct {
 	Port          int
 	Host          string
 	Local         bool
+	OutboundOnly  bool
 	WakeEvery     time.Duration
 	TailscaleWait time.Duration
 	WebhookURL    string
@@ -47,6 +48,7 @@ type Server struct {
 	port          int
 	host          string
 	local         bool
+	outboundOnly  bool
 	wakeEvery     time.Duration
 	tailscaleWait time.Duration
 	webhookURL    string
@@ -54,13 +56,14 @@ type Server struct {
 	client        *http.Client
 	log           *log.Logger
 
-	lock          *home.Lock
-	ln            net.Listener
-	http          *http.Server
-	baseURL       string
-	bindIP        string
-	advertiseHost string
-	swap          *swappingListener
+	lock            *home.Lock
+	ln              net.Listener
+	http            *http.Server
+	baseURL         string
+	bindIP          string
+	advertiseHost   string
+	swap            *swappingListener
+	lastOfflineWarn time.Time
 }
 
 // New loads identity, name, and the database. It does not listen.
@@ -111,6 +114,7 @@ func New(cfg Config) (*Server, error) {
 		port:          cfg.Port,
 		host:          strings.TrimSpace(cfg.Host),
 		local:         cfg.Local,
+		outboundOnly:  cfg.OutboundOnly,
 		wakeEvery:     cfg.WakeEvery,
 		tailscaleWait: cfg.TailscaleWait,
 		webhookURL:    cfg.WebhookURL,
@@ -134,6 +138,11 @@ func (s *Server) BaseURL() string { return s.baseURL }
 
 // Local reports whether the server was asked to bind on loopback.
 func (s *Server) Local() bool { return s.local }
+
+// OutboundOnly reports whether this agent cannot accept inbound push.
+func (s *Server) OutboundOnly() bool { return s.outboundOnly }
+
+func (s *Server) skipTailnet() bool { return s.local || s.outboundOnly }
 
 // Close releases the listener, database, and serve lock.
 func (s *Server) Close() error {
@@ -164,6 +173,11 @@ func (s *Server) BindContext(ctx context.Context) error {
 		return err
 	}
 	s.lock = lock
+	if err := s.dir.SetOutboundOnly(s.outboundOnly); err != nil {
+		s.lock.Unlock()
+		s.lock = nil
+		return err
+	}
 	bindIP, advHost, err := s.resolveBind(ctx)
 	if err != nil {
 		s.lock.Unlock()
@@ -185,13 +199,14 @@ func (s *Server) BindContext(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	s.warnIfTailnetOffline(ctx)
 	return nil
 }
 
 func (s *Server) resolveBind(ctx context.Context) (bindIP, advertiseHost string, err error) {
-	if s.local {
+	if s.skipTailnet() {
 		adv := "127.0.0.1"
-		if s.host != "" {
+		if s.host != "" && s.local && !s.outboundOnly {
 			adv = s.host
 		}
 		return "127.0.0.1", adv, nil
@@ -238,7 +253,7 @@ func (s *Server) listenOn(bindIP, advertiseHost string) error {
 }
 
 func (s *Server) rebindIfNeeded() {
-	if s.local || s.swap == nil {
+	if s.skipTailnet() || s.swap == nil {
 		return
 	}
 	ip, ok := listenaddr.TailscaleIPv4()
@@ -312,8 +327,29 @@ func (s *Server) wake(ctx context.Context) {
 // Tick retries undelivered outbound messages and webhook nudges.
 func (s *Server) Tick(ctx context.Context) {
 	s.rebindIfNeeded()
+	s.warnIfTailnetOffline(ctx)
 	s.retryOutbound(ctx)
 	s.nudgeInbound(ctx)
+}
+
+func (s *Server) warnIfTailnetOffline(ctx context.Context) {
+	if s.skipTailnet() {
+		return
+	}
+	online, checked := listenaddr.SelfOnline(ctx)
+	if !checked {
+		return
+	}
+	if online {
+		s.lastOfflineWarn = time.Time{}
+		return
+	}
+	now := time.Now()
+	if !s.lastOfflineWarn.IsZero() && now.Sub(s.lastOfflineWarn) < time.Minute {
+		return
+	}
+	s.lastOfflineWarn = now
+	s.log.Print(listenaddr.OfflineMessage)
 }
 
 func (s *Server) retryOutbound(ctx context.Context) {
@@ -325,6 +361,15 @@ func (s *Server) retryOutbound(ctx context.Context) {
 	for _, m := range msgs {
 		c, err := s.store.GetContact(m.PeerPub)
 		if err != nil {
+			continue
+		}
+		if c.PullOnly {
+			if err := s.store.MarkDelivered(m.ID); err != nil {
+				s.log.Printf("wake: mark pull-only delivered id=%d: %v", m.ID, err)
+			}
+			continue
+		}
+		if c.BaseURL == "" {
 			continue
 		}
 		if err := push.Message(ctx, s.client, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body)); err != nil {
@@ -412,10 +457,11 @@ func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, struct {
-		V         int    `json:"v"`
-		Name      string `json:"name"`
-		PublicKey string `json:"public_key"`
-	}{V: 1, Name: name, PublicKey: s.pub})
+		V            int    `json:"v"`
+		Name         string `json:"name"`
+		PublicKey    string `json:"public_key"`
+		OutboundOnly bool   `json:"outbound_only,omitempty"`
+	}{V: 1, Name: name, PublicKey: s.pub, OutboundOnly: s.outboundOnly})
 }
 
 func (s *Server) handleAllow(w http.ResponseWriter, _ *http.Request, key string) {
@@ -462,14 +508,21 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid signature")
 		return
 	}
-	baseURL, err := NormalizeBaseURL(hs.BaseURL)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	fromLoopback := remoteIsLoopback(r)
-	if listenaddr.IsLoopbackURL(baseURL) && !fromLoopback {
-		writeError(w, http.StatusBadRequest, "loopback URL is not reachable from here")
+	baseURL := ""
+	if strings.TrimSpace(hs.BaseURL) != "" {
+		var err error
+		baseURL, err = NormalizeBaseURL(hs.BaseURL)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		fromLoopback := remoteIsLoopback(r)
+		if listenaddr.IsLoopbackURL(baseURL) && !fromLoopback && !hs.OutboundOnly {
+			writeError(w, http.StatusBadRequest, "loopback URL is not reachable from here")
+			return
+		}
+	} else if !hs.OutboundOnly {
+		writeError(w, http.StatusBadRequest, "base URL is empty")
 		return
 	}
 	label := hs.Name
@@ -481,6 +534,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Label:      label,
 		BaseURL:    baseURL,
 		StatedName: hs.Name,
+		PullOnly:   hs.OutboundOnly,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "unavailable")
 		return

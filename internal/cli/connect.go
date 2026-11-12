@@ -36,6 +36,15 @@ func (e env) cmdInvite(args []string) int {
 	} else {
 		u = listenaddr.WouldBind(listenaddr.DefaultPort)
 	}
+	if dir.OutboundOnly() {
+		priv, err := dir.Identity()
+		if err != nil {
+			return e.fail(err)
+		}
+		fmt.Fprintln(e.stderr, "string-can: this agent is outbound-only; do not give a loopback URL to a remote peer. Connect to their URL, or have them run:")
+		fmt.Fprintf(e.stdout, "string-can connect --pull-only %s\n", canon.PublicHexFromPrivate(priv))
+		return 0
+	}
 	if listenaddr.IsLoopbackURL(u) {
 		fmt.Fprintln(e.stderr, "string-can: warning: this invite URL is loopback; do not give it to a peer on another machine")
 	}
@@ -45,10 +54,11 @@ func (e env) cmdInvite(args []string) int {
 
 func (e env) cmdConnect(ctx context.Context, args []string) int {
 	var label string
-	var local bool
+	var local, pullOnly bool
 	fs := newFlagSet("connect")
 	fs.StringVar(&label, "name", "", "local label for this contact")
 	fs.BoolVar(&local, "local", false, "allow a loopback peer URL")
+	fs.BoolVar(&pullOnly, "pull-only", false, "peer cannot accept push; they will fetch")
 	pos, help, err := parseWith(fs, args, map[string]bool{"name": true})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("connect"))
@@ -60,7 +70,14 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 	var wantKey, rawURL string
 	switch len(pos) {
 	case 1:
-		rawURL = pos[0]
+		if key, nerr := canon.NormalizeKey(pos[0]); nerr == nil {
+			if !pullOnly {
+				return e.fail(fmt.Errorf("public key without URL requires --pull-only"))
+			}
+			wantKey = key
+		} else {
+			rawURL = pos[0]
+		}
 	case 2:
 		wantKey, err = canon.NormalizeKey(pos[0])
 		if err != nil {
@@ -68,26 +85,35 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 		}
 		rawURL = pos[1]
 	default:
-		return e.fail(fmt.Errorf("usage: string-can connect <url> [--name <label>] [--local]"))
+		return e.fail(fmt.Errorf("usage: string-can connect <url> [--name <label>] [--local] [--pull-only]"))
 	}
-	baseURL, err := server.NormalizeBaseURL(rawURL)
-	if err != nil {
-		return e.fail(err)
-	}
-	if listenaddr.IsLoopbackURL(baseURL) && !local {
-		return e.fail(fmt.Errorf("refusing loopback URL %s (that would be this machine). Pass --local for two agents on one host, or use the peer's Tailscale / MagicDNS URL", baseURL))
-	}
-	stated, gotKey, reachable, mismatch, err := probePeer(ctx, baseURL, wantKey)
-	if err != nil {
-		return e.fail(err)
-	}
-	if mismatch {
-		return e.fail(fmt.Errorf("peer public key mismatch"))
+	var baseURL, stated string
+	reachable := false
+	if rawURL != "" {
+		baseURL, err = server.NormalizeBaseURL(rawURL)
+		if err != nil {
+			return e.fail(err)
+		}
+		if listenaddr.IsLoopbackURL(baseURL) && !local && !pullOnly {
+			return e.fail(fmt.Errorf("refusing loopback URL %s (that would be this machine). Pass --local for two agents on one host, or use the peer's Tailscale / MagicDNS URL", baseURL))
+		}
+		var gotKey string
+		var mismatch, outboundOnly bool
+		stated, gotKey, reachable, mismatch, outboundOnly, err = probePeer(ctx, baseURL, wantKey)
+		if err != nil {
+			return e.fail(err)
+		}
+		if mismatch {
+			return e.fail(fmt.Errorf("peer public key mismatch"))
+		}
+		if outboundOnly {
+			pullOnly = true
+		}
+		if wantKey == "" {
+			wantKey = gotKey
+		}
 	}
 	key := wantKey
-	if key == "" {
-		key = gotKey
-	}
 	if key == "" {
 		return e.fail(fmt.Errorf("peer was not reachable; cannot learn public key. Retry connect, or pass the public key as well"))
 	}
@@ -108,20 +134,25 @@ func (e env) cmdConnect(ctx context.Context, args []string) int {
 		Label:      label,
 		BaseURL:    baseURL,
 		StatedName: stated,
+		PullOnly:   pullOnly,
 	}
 	if err := st.UpsertContact(c); err != nil {
 		return e.fail(err)
 	}
-	if !reachable {
-		fmt.Fprintln(e.stderr, "string-can: saved; delivery will retry")
-	} else {
+	if pullOnly {
+		fmt.Fprintln(e.stderr, "string-can: saved as pull-only; they will fetch, we will not push")
+	}
+	if reachable && baseURL != "" {
 		e.tryHandshake(ctx, dir, baseURL)
+	} else if !pullOnly {
+		fmt.Fprintln(e.stderr, "string-can: saved; delivery will retry")
 	}
 	return e.writeJSON(contactJSON{
 		Label:      c.Label,
 		PublicKey:  c.PublicKey,
 		BaseURL:    c.BaseURL,
 		StatedName: c.StatedName,
+		PullOnly:   c.PullOnly,
 	})
 }
 
@@ -141,7 +172,7 @@ func (e env) tryHandshake(ctx context.Context, dir home.Dir, peerURL string) {
 	if ourURL == "" {
 		ourURL = listenaddr.WouldBind(listenaddr.DefaultPort)
 	}
-	body, err := push.EncodeHandshake(canon.PublicHexFromPrivate(priv), name, ourURL)
+	body, err := push.EncodeHandshake(canon.PublicHexFromPrivate(priv), name, ourURL, dir.OutboundOnly())
 	if err != nil {
 		return
 	}
@@ -151,45 +182,45 @@ func (e env) tryHandshake(ctx context.Context, dir home.Dir, peerURL string) {
 	}
 }
 
-func probePeer(ctx context.Context, baseURL, wantKey string) (stated, gotKey string, reachable, mismatch bool, err error) {
+func probePeer(ctx context.Context, baseURL, wantKey string) (stated, gotKey string, reachable, mismatch, outboundOnly bool, err error) {
 	deadline := time.Now().Add(ProbeWait)
 	for {
-		stated, gotKey, reachable, mismatch, err = probeOnce(ctx, baseURL, wantKey)
+		stated, gotKey, reachable, mismatch, outboundOnly, err = probeOnce(ctx, baseURL, wantKey)
 		if err != nil {
-			return "", "", false, false, err
+			return "", "", false, false, false, err
 		}
 		if mismatch || reachable {
-			return stated, gotKey, reachable, mismatch, nil
+			return stated, gotKey, reachable, mismatch, outboundOnly, nil
 		}
 		if !time.Now().Before(deadline) {
-			return "", "", false, false, nil
+			return "", "", false, false, false, nil
 		}
 		timer := time.NewTimer(ProbeInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return "", "", false, false, nil
+			return "", "", false, false, false, nil
 		case <-timer.C:
 		}
 	}
 }
 
-func probeOnce(ctx context.Context, baseURL, wantKey string) (stated, gotKey string, reachable, mismatch bool, err error) {
+func probeOnce(ctx context.Context, baseURL, wantKey string) (stated, gotKey string, reachable, mismatch, outboundOnly bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	info, err := push.GetInfo(ctx, push.DefaultClient(), baseURL)
 	if err != nil {
-		return "", "", false, false, nil
+		return "", "", false, false, false, nil
 	}
 	if info.PublicKey == "" {
-		return "", "", false, false, nil
+		return "", "", false, false, false, nil
 	}
 	got, nerr := canon.NormalizeKey(info.PublicKey)
 	if nerr != nil {
-		return "", "", false, false, nil
+		return "", "", false, false, false, nil
 	}
 	if wantKey != "" && got != wantKey {
-		return "", got, false, true, nil
+		return "", got, false, true, info.OutboundOnly, nil
 	}
-	return info.Name, got, true, false, nil
+	return info.Name, got, true, false, info.OutboundOnly, nil
 }

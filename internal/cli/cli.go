@@ -29,15 +29,16 @@ Usage:
   string-can pubkey
   string-can url
   string-can name <display-name>
-  string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local]
+  string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]
   string-can invite
-  string-can connect <url> [--name <label>] [--local]
-  string-can connect <public-key> <base-url> [--name <label>] [--local]
+  string-can connect <url> [--name <label>] [--local] [--pull-only]
+  string-can connect <public-key> <base-url> [--name <label>] [--local] [--pull-only]
+  string-can connect --pull-only <public-key> [--name <label>]
   string-can rename <public-key> <label>
   string-can contacts
   string-can send <public-key> <text>
   string-can thread <public-key> [--since <id>]
-  string-can fetch <public-key>
+  string-can fetch <public-key> [--watch] [--every <duration>]
   string-can status
   string-can doctor
 
@@ -184,14 +185,17 @@ func (e env) cmdName(args []string) int {
 
 func (e env) cmdServe(ctx context.Context, args []string) int {
 	var name, host string
-	var local bool
+	var local, outboundOnly bool
+	var wait time.Duration
 	port := listenaddr.DefaultPort
 	fs := newFlagSet("serve")
 	fs.StringVar(&name, "name", "", "display name")
 	fs.IntVar(&port, "port", listenaddr.DefaultPort, "listen port")
 	fs.StringVar(&host, "host", "", "advertised hostname (MagicDNS)")
 	fs.BoolVar(&local, "local", false, "bind to 127.0.0.1 for same-machine peers")
-	pos, help, err := parseWith(fs, args, map[string]bool{"name": true, "port": true, "host": true})
+	fs.BoolVar(&outboundOnly, "outbound-only", false, "this agent cannot accept inbound push; bind locally and advertise pull-only")
+	fs.DurationVar(&wait, "wait", 0, "how long to wait for a Tailscale address (0 = forever)")
+	pos, help, err := parseWith(fs, args, map[string]bool{"name": true, "port": true, "host": true, "wait": true})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("serve"))
 		return 0
@@ -200,7 +204,7 @@ func (e env) cmdServe(ctx context.Context, args []string) int {
 		return e.fail(err)
 	}
 	if len(pos) != 0 {
-		return e.fail(fmt.Errorf("usage: string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local]"))
+		return e.fail(fmt.Errorf("usage: string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]"))
 	}
 	if port < 0 || port > 65535 {
 		return e.fail(fmt.Errorf("invalid port"))
@@ -212,13 +216,15 @@ func (e env) cmdServe(ctx context.Context, args []string) int {
 	webhookURL := os.Getenv("STRING_CAN_WEBHOOK_URL")
 	webhookToken := os.Getenv("STRING_CAN_WEBHOOK_TOKEN")
 	srv, err := server.New(server.Config{
-		Home:         dir.Path,
-		Name:         name,
-		Port:         port,
-		Host:         host,
-		Local:        local,
-		WebhookURL:   webhookURL,
-		WebhookToken: webhookToken,
+		Home:          dir.Path,
+		Name:          name,
+		Port:          port,
+		Host:          host,
+		Local:         local,
+		OutboundOnly:  outboundOnly,
+		TailscaleWait: wait,
+		WebhookURL:    webhookURL,
+		WebhookToken:  webhookToken,
 	})
 	if err != nil {
 		return e.fail(err)
@@ -231,7 +237,9 @@ func (e env) cmdServe(ctx context.Context, args []string) int {
 	}
 	fmt.Fprintf(e.stdout, "string-can public key: %s\n", srv.PublicKey())
 	fmt.Fprintf(e.stdout, "string-can listen: %s\n", srv.BaseURL())
-	if listenaddr.IsLoopbackURL(srv.BaseURL()) {
+	if srv.OutboundOnly() {
+		fmt.Fprintln(e.stderr, "string-can: outbound-only; bound to 127.0.0.1. Peers cannot push here. Connect to their URL, then fetch or fetch --watch to receive.")
+	} else if listenaddr.IsLoopbackURL(srv.BaseURL()) {
 		fmt.Fprintln(e.stderr, "string-can: warning: bound to 127.0.0.1; unreachable from other machines. Pass --local only for two agents on one host.")
 	}
 	e.printWebhookStatus(ctx, webhookURL, webhookToken)
@@ -290,6 +298,7 @@ func (e env) cmdRename(args []string) int {
 		PublicKey:  c.PublicKey,
 		BaseURL:    c.BaseURL,
 		StatedName: c.StatedName,
+		PullOnly:   c.PullOnly,
 	})
 }
 
@@ -315,7 +324,8 @@ func (e env) cmdContacts(args []string) int {
 			Label      string `json:"label"`
 			BaseURL    string `json:"base_url"`
 			StatedName string `json:"stated_name"`
-		}{c.PublicKey, c.Label, c.BaseURL, c.StatedName}); err != 0 {
+			PullOnly   bool   `json:"pull_only"`
+		}{c.PublicKey, c.Label, c.BaseURL, c.StatedName, c.PullOnly}); err != 0 {
 			return err
 		}
 	}
@@ -379,6 +389,13 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	if c.PullOnly {
+		if err := st.MarkDelivered(id); err != nil {
+			return e.fail(err)
+		}
+		fmt.Fprintf(e.stdout, "sent %d (pull)\n", id)
+		return 0
+	}
 	if err := push.Message(ctx, push.DefaultClient(), c.BaseURL, from, sig, body); err != nil {
 		_ = st.SetLastError(id, err.Error())
 		fmt.Fprintf(e.stdout, "sent %d pending\n", id)
@@ -438,6 +455,7 @@ type contactJSON struct {
 	PublicKey  string `json:"public_key"`
 	BaseURL    string `json:"base_url"`
 	StatedName string `json:"stated_name"`
+	PullOnly   bool   `json:"pull_only"`
 }
 
 func (e env) writeJSON(v any) int {
@@ -552,11 +570,11 @@ func commandHelp(name string) string {
 	case "name":
 		return "usage: string-can name <display-name>\n"
 	case "serve":
-		return "usage: string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local]\n"
+		return "usage: string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]\n"
 	case "invite":
 		return "usage: string-can invite\n"
 	case "connect":
-		return "usage: string-can connect <url> [--name <label>] [--local]\n       string-can connect <public-key> <base-url> [--name <label>] [--local]\n"
+		return "usage: string-can connect <url> [--name <label>] [--local] [--pull-only]\n       string-can connect <public-key> <base-url> [--name <label>] [--local] [--pull-only]\n       string-can connect --pull-only <public-key> [--name <label>]\n"
 	case "rename":
 		return "usage: string-can rename <public-key> <label>\n"
 	case "contacts":
@@ -566,7 +584,7 @@ func commandHelp(name string) string {
 	case "thread":
 		return "usage: string-can thread <public-key> [--since <id>]\n"
 	case "fetch":
-		return "usage: string-can fetch <public-key>\n"
+		return "usage: string-can fetch <public-key> [--watch] [--every <duration>]\n"
 	case "status":
 		return "usage: string-can status\n"
 	case "doctor":

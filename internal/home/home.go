@@ -14,6 +14,7 @@ const (
 	identityFile = "identity.key"
 	nameFile     = "name"
 	listenFile   = "listen.url"
+	outboundFile = "outbound-only"
 	dbFile       = "string-can.db"
 	lockFile     = "serve.lock"
 	DefaultName  = "string-can"
@@ -139,6 +140,32 @@ func (d Dir) SetListenURL(u string) error {
 		return err
 	}
 	return os.WriteFile(d.file(listenFile), []byte(u), 0o644)
+}
+
+// OutboundOnly reports whether the last serve advertised pull-only.
+func (d Dir) OutboundOnly() bool {
+	b, err := os.ReadFile(d.file(outboundFile))
+	if err != nil {
+		return false
+	}
+	s := strings.TrimSpace(string(b))
+	return s == "1" || strings.EqualFold(s, "true")
+}
+
+// SetOutboundOnly records whether this agent cannot accept inbound push.
+func (d Dir) SetOutboundOnly(v bool) error {
+	if err := d.Ensure(); err != nil {
+		return err
+	}
+	path := d.file(outboundFile)
+	if !v {
+		err := os.Remove(path)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return os.WriteFile(path, []byte("1\n"), 0o644)
 }
 
 // Lock is an exclusive flock on the home directory.

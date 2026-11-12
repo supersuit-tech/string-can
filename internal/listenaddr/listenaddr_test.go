@@ -1,6 +1,13 @@
 package listenaddr
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 func TestIsLoopbackHost(t *testing.T) {
 	for _, host := range []string{"127.0.0.1", "localhost", "LOCALHOST", "::1", "[::1]"} {
@@ -48,5 +55,62 @@ func TestURL(t *testing.T) {
 	}
 	if got := URL("100.64.0.1", 8741); got != "http://100.64.0.1:8741" {
 		t.Fatalf("got %s", got)
+	}
+}
+
+func TestWaitForTailscaleHint(t *testing.T) {
+	oldFind := FindTailscaleIPv4
+	oldHint := HintAfter
+	t.Cleanup(func() {
+		FindTailscaleIPv4 = oldFind
+		HintAfter = oldHint
+	})
+	FindTailscaleIPv4 = func() (string, bool) { return "", false }
+	HintAfter = 40 * time.Millisecond
+
+	var msgs []string
+	_, err := WaitForTailscale(context.Background(), 120*time.Millisecond, 15*time.Millisecond, func(s string) {
+		msgs = append(msgs, s)
+	})
+	if !errors.Is(err, ErrNoTailscale) {
+		t.Fatalf("err %v", err)
+	}
+	joined := strings.Join(msgs, "\n")
+	if !strings.Contains(joined, NoTailnetHint) {
+		t.Fatalf("missing hint: %q", joined)
+	}
+	if !strings.Contains(err.Error(), "--outbound-only") {
+		t.Fatalf("timeout should mention outbound-only: %v", err)
+	}
+}
+
+func TestSelfOnline(t *testing.T) {
+	old := ReadTailscaleStatus
+	t.Cleanup(func() { ReadTailscaleStatus = old })
+
+	ReadTailscaleStatus = func(context.Context) ([]byte, error) {
+		return []byte(`{"Self":{"Online":true}}`), nil
+	}
+	online, checked := SelfOnline(context.Background())
+	if !checked || !online {
+		t.Fatalf("online=%v checked=%v", online, checked)
+	}
+
+	ReadTailscaleStatus = func(context.Context) ([]byte, error) {
+		return []byte(`{"Self":{"Online":false}}`), nil
+	}
+	online, checked = SelfOnline(context.Background())
+	if !checked || online {
+		t.Fatalf("offline: online=%v checked=%v", online, checked)
+	}
+
+	var n atomic.Int32
+	ReadTailscaleStatus = func(context.Context) ([]byte, error) {
+		n.Add(1)
+		return nil, errors.New("missing")
+	}
+	online, checked = SelfOnline(context.Background())
+	if checked || online {
+		t.Fatalf("missing CLI: online=%v checked=%v", online, checked)
 	}
 }
