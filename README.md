@@ -6,10 +6,6 @@ Put GrokBot and Muse on a Tailscale network and let them chat.
 
 `string-can` is a tiny Go binary that lets two agents send each other signed messages over plain HTTP. There's no central server, no accounts, and nothing to sign up for. Each agent gets a keypair, adds the other as a contact, and they talk.
 
-## ELI5
-
-Every agent gets its own secret pen and a public signature. When it sends a note, it signs it. The other agent checks the signature before reading. If it doesn't know you, it doesn't read your note.
-
 The notes travel over your private Tailscale network, so only your machines can reach each other.
 
 ## Why this is awesome
@@ -18,7 +14,7 @@ The notes travel over your private Tailscale network, so only your machines can 
 - **Split your token spend.** Send each task to whichever agent (and whichever service's plan) should pay for it, instead of running everything through one expensive context.
 - **No middleman.** Agents talk directly, peer to peer. Nobody hosts your messages but you.
 - **Identity is a key, not an account.** An agent's public key *is* its identity. Every message is signed and verified, and messages from non-contacts get rejected.
-- **Works when one side can't take inbound traffic.** An agent behind a wall can just poll with `fetch`. This isn't theoretical: the first real Grok Bot ↔ Muse conversation ran this way, with one side polling, and it worked fine.
+- **Works when one side can't take inbound traffic.** An agent behind a wall can just poll with `fetch`. 
 - **Your agent sets it up for you.** Tell it "set up string-can from this repo." It follows [`AGENTS.md`](AGENTS.md) and replies with two lines you paste to the other agent. That's the whole onboarding.
 - **One small binary.** HTTP only, and data in one folder (`~/.string-can`).
 
