@@ -6,6 +6,7 @@ package wake
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"golang.org/x/net/http/httpproxy"
 
 	"github.com/supersuit-tech/string-can/internal/canon"
 	"github.com/supersuit-tech/string-can/internal/push"
@@ -31,7 +34,14 @@ const (
 	DefaultPoll = time.Second
 	// MaskedToken is the only token string safe to print.
 	MaskedToken = "********"
-	wakeType    = "string-can.wake"
+	// ProxyEnv is shown when the wake POST uses the process proxy environment.
+	ProxyEnv = "env"
+	// ProxyDirect means the wake POST uses no proxy.
+	ProxyDirect = "direct"
+	// ProxyInvalid means the configured wake proxy cannot be used.
+	ProxyInvalid = "invalid"
+	wakeType     = "string-can.wake"
+	proxyEnvKey  = "STRING_CAN_WAKE_PROXY"
 )
 
 // MaskURL returns scheme and host, with the path and query hidden.
@@ -67,6 +77,101 @@ func NormalizeURL(raw string) (string, error) {
 		return "", fmt.Errorf("wake URL must not include a username or password; use --token-file or --token-env")
 	}
 	return u.String(), nil
+}
+
+// MaskProxy hides userinfo, query, and any non-root path in a proxy URL.
+// "direct" stays "direct". An empty string stays empty. Anything that is
+// not an http, https, or socks5 URL is reported as "configured".
+func MaskProxy(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.EqualFold(raw, ProxyDirect) {
+		return ProxyDirect
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return "configured"
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5":
+	default:
+		return "configured"
+	}
+	// Build this by hand. url.URL.String escapes "*" in userinfo, which would
+	// turn the mask into %2A and make the printed form hard to recognize.
+	var b strings.Builder
+	b.WriteString(strings.ToLower(u.Scheme))
+	b.WriteString("://")
+	if u.User != nil {
+		b.WriteString(MaskedToken)
+		b.WriteByte('@')
+	}
+	b.WriteString(u.Host)
+	if u.Path != "" && u.Path != "/" {
+		b.WriteString("/...")
+	}
+	return b.String()
+}
+
+// NormalizeProxy checks a wake proxy setting. "direct" means no proxy.
+// "env" clears a per-contact override so the process environment applies.
+// A URL must be http, https, or socks5. Userinfo is allowed and is returned
+// unchanged; callers must not log it. The error text never includes raw.
+func NormalizeProxy(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	switch {
+	case raw == "":
+		return "", fmt.Errorf("wake proxy must be an http, https, or socks5 URL, or %q", ProxyDirect)
+	case strings.EqualFold(raw, ProxyDirect):
+		return ProxyDirect, nil
+	case strings.EqualFold(raw, ProxyEnv):
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("wake proxy must be an http, https, or socks5 URL, or %q", ProxyDirect)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5":
+		u.Scheme = strings.ToLower(u.Scheme)
+	default:
+		return "", fmt.Errorf("wake proxy must be an http, https, or socks5 URL, or %q", ProxyDirect)
+	}
+	return u.String(), nil
+}
+
+// EffectiveProxy resolves the proxy for one wake POST.
+// A non-empty contactProxy wins over STRING_CAN_WAKE_PROXY.
+// The result is "" (use HTTP_PROXY / HTTPS_PROXY / NO_PROXY), "direct",
+// or a proxy URL. The error does not include the setting.
+func EffectiveProxy(contactProxy string) (string, error) {
+	raw := strings.TrimSpace(contactProxy)
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv(proxyEnvKey))
+	}
+	if raw == "" {
+		return "", nil
+	}
+	return NormalizeProxy(raw)
+}
+
+// ProxyLabel is the proxy mode a wake POST will use: "env", "direct",
+// "invalid", or a proxy URL with userinfo masked.
+func ProxyLabel(contactProxy string) string {
+	spec, err := EffectiveProxy(contactProxy)
+	if err != nil {
+		return ProxyInvalid
+	}
+	switch spec {
+	case "":
+		return ProxyEnv
+	case ProxyDirect:
+		return ProxyDirect
+	default:
+		return MaskProxy(spec)
+	}
 }
 
 // LoadToken reads a bearer token from a file, an environment variable, or
@@ -202,7 +307,7 @@ func Try(ctx context.Context, st *store.Store, peerPub, peerURL, from string, lo
 			logf("peer wake: internal error")
 		}
 	}()
-	wakeURL, token, err := st.LoadWake(peerPub)
+	wakeURL, token, proxy, err := st.LoadWake(peerPub)
 	if err != nil {
 		logf("peer wake: %s", redact(err.Error(), "", ""))
 		return false
@@ -214,15 +319,15 @@ func Try(ctx context.Context, st *store.Store, peerPub, peerURL, from string, lo
 	now := time.Now()
 	claimed, err := st.ClaimWake(peerPub, now.UnixMilli(), interval.Milliseconds())
 	if err != nil {
-		logf("peer wake: %s not claimed: %s", canon.ShortKey(peerPub), redact(err.Error(), wakeURL, token))
+		logf("peer wake: %s not claimed: %s", canon.ShortKey(peerPub), redact(err.Error(), wakeURL, token, proxy))
 		return false
 	}
 	if !claimed {
 		logf("peer wake: skipped %s (at most once per %s)", canon.ShortKey(peerPub), interval)
 		return false
 	}
-	if err := post(ctx, wakeURL, token, from); err != nil {
-		logf("peer wake: post failed for %s: %s", canon.ShortKey(peerPub), redact(err.Error(), wakeURL, token))
+	if err := post(ctx, wakeURL, token, from, proxy); err != nil {
+		logf("peer wake: post failed for %s: %s", canon.ShortKey(peerPub), redact(err.Error(), wakeURL, token, proxy, os.Getenv(proxyEnvKey)))
 		return false
 	}
 	logf("peer wake: posted %s for %s", MaskURL(wakeURL), canon.ShortKey(peerPub))
@@ -242,8 +347,16 @@ func Try(ctx context.Context, st *store.Store, peerPub, peerURL, from string, lo
 	return true
 }
 
-func post(ctx context.Context, wakeURL, token, from string) error {
+func post(ctx context.Context, wakeURL, token, from, contactProxy string) error {
 	body, err := encode(from)
+	if err != nil {
+		return err
+	}
+	spec, err := EffectiveProxy(contactProxy)
+	if err != nil {
+		return err
+	}
+	client, err := wakeClient(spec)
 	if err != nil {
 		return err
 	}
@@ -257,10 +370,9 @@ func post(ctx context.Context, wakeURL, token, from string) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return errors.New(redact(err.Error(), wakeURL, token, contactProxy, spec))
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
@@ -284,6 +396,8 @@ func encode(from string) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }
 
+// pollPeer uses the process proxy, the same transport as send and fetch.
+// Only the wake POST goes through wakeClient.
 func pollPeer(ctx context.Context, peerURL string, wait, every time.Duration) bool {
 	if wait <= 0 {
 		return false
@@ -323,9 +437,47 @@ func pollPeer(ctx context.Context, peerURL string, wait, every time.Duration) bo
 	}
 }
 
-func redact(msg, wakeURL, token string) string {
-	// Replace the URL first. Replacing the token first would split the URL
-	// and leave the secret path in the log.
+// wakeClient is the HTTP client for the wake POST only.
+// spec "" uses HTTP_PROXY, HTTPS_PROXY, and NO_PROXY, read at request time.
+// spec "direct" uses no proxy. Any other spec is a proxy URL.
+func wakeClient(spec string) (*http.Client, error) {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || base == nil {
+		base = &http.Transport{}
+	}
+	tr := base.Clone()
+	switch spec {
+	case "":
+		tr.Proxy = processProxy
+	case ProxyDirect:
+		tr.Proxy = nil
+	default:
+		u, err := url.Parse(spec)
+		if err != nil || u.Hostname() == "" {
+			return nil, fmt.Errorf("wake proxy must be an http, https, or socks5 URL, or %q", ProxyDirect)
+		}
+		tr.Proxy = http.ProxyURL(u)
+	}
+	return &http.Client{Timeout: 10 * time.Second, Transport: tr}, nil
+}
+
+// processProxy matches net/http's ProxyFromEnvironment. The standard helper
+// caches the first environment lookup for the life of the process; reading
+// it here keeps the unset fallback equal to the process proxy env at send time.
+func processProxy(req *http.Request) (*url.URL, error) {
+	if req == nil || req.URL == nil {
+		return nil, nil
+	}
+	return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
+}
+
+func redact(msg, wakeURL, token string, proxies ...string) string {
+	// Replace proxy URLs before the wake URL. A proxy userinfo string can
+	// contain the same secret as the webhook path; replacing the token
+	// first would split the URL and leave the rest in the log.
+	for _, proxy := range proxies {
+		msg = redactProxy(msg, proxy)
+	}
 	if wakeURL != "" {
 		msg = strings.ReplaceAll(msg, wakeURL, MaskURL(wakeURL))
 	}
@@ -333,5 +485,41 @@ func redact(msg, wakeURL, token string) string {
 		msg = strings.ReplaceAll(msg, "Bearer "+token, "Bearer "+MaskedToken)
 		msg = strings.ReplaceAll(msg, token, MaskedToken)
 	}
+	return msg
+}
+
+func redactProxy(msg, proxy string) string {
+	proxy = strings.TrimSpace(proxy)
+	if proxy == "" || strings.EqualFold(proxy, ProxyDirect) || strings.EqualFold(proxy, ProxyEnv) {
+		return msg
+	}
+	if masked := MaskProxy(proxy); masked != "" && masked != "configured" {
+		msg = strings.ReplaceAll(msg, proxy, masked)
+	} else {
+		msg = strings.ReplaceAll(msg, proxy, "configured")
+	}
+	u, err := url.Parse(proxy)
+	if err != nil || u == nil || u.User == nil {
+		return msg
+	}
+	user := u.User.Username()
+	pass, _ := u.User.Password()
+	if info := u.User.String(); info != "" {
+		msg = strings.ReplaceAll(msg, info, MaskedToken)
+	}
+	if pass != "" {
+		msg = strings.ReplaceAll(msg, pass, MaskedToken)
+		if enc := url.PathEscape(pass); enc != pass {
+			msg = strings.ReplaceAll(msg, enc, MaskedToken)
+		}
+		if enc := url.QueryEscape(pass); enc != pass {
+			msg = strings.ReplaceAll(msg, enc, MaskedToken)
+		}
+	}
+	if len(user) >= 3 {
+		msg = strings.ReplaceAll(msg, user, MaskedToken)
+	}
+	raw := user + ":" + pass
+	msg = strings.ReplaceAll(msg, "Basic "+base64.StdEncoding.EncodeToString([]byte(raw)), "Basic "+MaskedToken)
 	return msg
 }

@@ -255,6 +255,7 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 	} else {
 		fmt.Fprintln(e.stdout, "webhook: configured")
 	}
+	fmt.Fprintf(e.stdout, "wake proxy: %s\n", wake.ProxyLabel(""))
 
 	st, err := store.Open(dir.DBPath())
 	if err != nil {
@@ -345,7 +346,7 @@ func wakeStatus(c store.Contact) string {
 	if c.WakeTokenSet {
 		token = wake.MaskedToken
 	}
-	return fmt.Sprintf("wake: %s token %s", wake.MaskURL(c.WakeURL), token)
+	return fmt.Sprintf("wake: %s token %s proxy %s", wake.MaskURL(c.WakeURL), token, wake.ProxyLabel(c.WakeProxy))
 }
 
 // reportFetch says whether fetch --watch is alive for each peer an

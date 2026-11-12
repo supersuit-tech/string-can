@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"flag"
 	"fmt"
 
 	"github.com/supersuit-tech/string-can/internal/canon"
@@ -29,15 +30,17 @@ func (e env) cmdWake(args []string) int {
 }
 
 func (e env) cmdWakeSet(args []string) int {
-	var file, envName, literal string
+	var file, envName, literal, proxyFlag string
 	fs := newFlagSet("wake set")
 	fs.StringVar(&file, "token-file", "", "file containing the bearer token")
 	fs.StringVar(&envName, "token-env", "", "environment variable holding the bearer token")
 	fs.StringVar(&literal, "token", "", "bearer token (stored in shell history; prefer --token-file or --token-env)")
+	fs.StringVar(&proxyFlag, "proxy", "", "proxy for this contact's wake POST (http, https, socks5, direct, or env)")
 	pos, help, err := parseWith(fs, args, map[string]bool{
 		"token-file": true,
 		"token-env":  true,
 		"token":      true,
+		"proxy":      true,
 	})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("wake"))
@@ -46,8 +49,14 @@ func (e env) cmdWakeSet(args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	proxySet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "proxy" {
+			proxySet = true
+		}
+	})
 	if len(pos) != 2 {
-		return e.fail(fmt.Errorf("usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>]"))
+		return e.fail(fmt.Errorf("usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]"))
 	}
 	key, err := canon.NormalizeKey(pos[0])
 	if err != nil {
@@ -61,6 +70,13 @@ func (e env) cmdWakeSet(args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	var proxy string
+	if proxySet {
+		proxy, err = wake.NormalizeProxy(proxyFlag)
+		if err != nil {
+			return e.fail(err)
+		}
+	}
 	if warning != "" {
 		fmt.Fprintln(e.stderr, "string-can: "+warning)
 	}
@@ -72,12 +88,19 @@ func (e env) cmdWakeSet(args []string) int {
 	// Omitting a token source leaves a token that was already stored.
 	// Pass --token-file, --token-env, or --token to replace it.
 	if file == "" && envName == "" && literal == "" {
-		if _, existing, lerr := st.LoadWake(key); lerr == nil {
+		if _, existing, _, lerr := st.LoadWake(key); lerr == nil {
 			token = existing
 		}
 	}
 	if err := st.SetWake(key, wakeURL, token); err != nil {
 		return e.fail(err)
+	}
+	// Omitting --proxy leaves a per-contact proxy that was already stored.
+	// --proxy env clears it so STRING_CAN_WAKE_PROXY (or the process proxy) applies.
+	if proxySet {
+		if err := st.SetWakeProxy(key, proxy); err != nil {
+			return e.fail(err)
+		}
 	}
 	c, err := st.GetContact(key)
 	if err != nil {
@@ -148,6 +171,7 @@ func wakeView(c store.Contact) struct {
 	PublicKey string `json:"public_key"`
 	WakeURL   string `json:"wake_url"`
 	WakeToken string `json:"wake_token"`
+	WakeProxy string `json:"wake_proxy"`
 } {
 	token := ""
 	if c.WakeTokenSet {
@@ -157,9 +181,11 @@ func wakeView(c store.Contact) struct {
 		PublicKey string `json:"public_key"`
 		WakeURL   string `json:"wake_url"`
 		WakeToken string `json:"wake_token"`
+		WakeProxy string `json:"wake_proxy"`
 	}{
 		PublicKey: c.PublicKey,
 		WakeURL:   wake.MaskURL(c.WakeURL),
 		WakeToken: token,
+		WakeProxy: wake.ProxyLabel(c.WakeProxy),
 	}
 }

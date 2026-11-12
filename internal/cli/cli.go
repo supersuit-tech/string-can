@@ -38,7 +38,7 @@ Usage:
   string-can connect --pull-only <public-key> [--name <label>]
   string-can rename <public-key> <label>
   string-can contacts
-  string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>]
+  string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]
   string-can wake show <public-key>
   string-can wake clear <public-key>
   string-can send <public-key> <text>
@@ -55,6 +55,8 @@ Environment:
   STRING_CAN_WAKE_WAIT       how long to poll a peer after waking it (default 60s)
   STRING_CAN_WAKE_INTERVAL   minimum gap between wakes of one contact (default 2m)
   STRING_CAN_WAKE_POLL       pause between those health checks (default 1s)
+  STRING_CAN_WAKE_PROXY      proxy for wake POSTs only (http, https, socks5 URL, or direct).
+                             Unset uses HTTP_PROXY / HTTPS_PROXY. A per-contact --proxy wins.
 `
 
 type env struct {
@@ -484,6 +486,7 @@ type contactJSON struct {
 	PullOnly   bool   `json:"pull_only"`
 	WakeURL    string `json:"wake_url"`
 	WakeToken  string `json:"wake_token"`
+	WakeProxy  string `json:"wake_proxy"`
 }
 
 func viewContact(c store.Contact) contactJSON {
@@ -499,6 +502,7 @@ func viewContact(c store.Contact) contactJSON {
 		PullOnly:   c.PullOnly,
 		WakeURL:    wake.MaskURL(c.WakeURL),
 		WakeToken:  token,
+		WakeProxy:  wake.ProxyLabel(c.WakeProxy),
 	}
 }
 
@@ -632,7 +636,7 @@ func commandHelp(name string) string {
 	case "contacts":
 		return "usage: string-can contacts\n"
 	case "wake":
-		return "usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>]\n       string-can wake show <public-key>\n       string-can wake clear <public-key>\n"
+		return "usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]\n       string-can wake show <public-key>\n       string-can wake clear <public-key>\n"
 	case "send":
 		return "usage: string-can send <public-key> <text>\n"
 	case "thread":

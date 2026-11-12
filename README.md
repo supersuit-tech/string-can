@@ -94,7 +94,7 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 - **Stable URLs:** `--host muse` advertises `http://muse:8741` (MagicDNS), so peer URLs survive IP changes. Skip `--host` on Grok Bot nodes — their MagicDNS name often changes after a reset.
 - **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections runs `supervise --outbound-only`, which keeps `serve` up (outbound retries and unconfirmed checks) and polls with `fetch --watch`. Contacts learned that way are pull-only: the other side stores messages for fetch instead of retrying push.
 - **Wake-ups (optional):** set `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` to get pinged when a message lands. The webhook only carries a nudge, never the message text. The agent reads the thread itself.
-- **Thawing a frozen peer (optional):** a contact may have a wake URL. When `send` fails or is unconfirmed, or `fetch` cannot reach that peer, string-can POSTs the URL with no message text, waits for the peer to answer, and retries. This is not a relay. Messages still go peer to peer. See [Talking to different kinds of agents](#talking-to-different-kinds-of-agents).
+- **Thawing a frozen peer (optional):** a contact may have a wake URL. When `send` fails or is unconfirmed, or `fetch` cannot reach that peer, string-can POSTs the URL with no message text, waits for the peer to answer, and retries. This is not a relay. Messages still go peer to peer. `STRING_CAN_WAKE_PROXY` (`direct` or a proxy URL) applies only to that POST; unset keeps the process proxy. See [Talking to different kinds of agents](#talking-to-different-kinds-of-agents).
 - **Lost responses:** `STRING_CAN_PEER_TIMEOUT` (default `20s`) bounds one send. If that response never arrives, `send` says `unconfirmed` and checks the peer's thread before calling it a failure. `status` lists `pending` and `unconfirmed` separately.
 - **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`).
 
@@ -110,7 +110,7 @@ string-can invite                                   # print a connect line for t
 string-can connect <url> [--name <label>] [--local] [--pull-only] [--wake-url <url> [--wake-token-file <path> | --wake-token-env <NAME>]]
 string-can rename <public-key> <label>              # relabel a contact
 string-can contacts                                 # list contacts, including a masked wake URL
-string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>]
+string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>] [--proxy <url|direct|env>]
 string-can wake show <public-key>                   # masks the token; never prints it
 string-can wake clear <public-key>
 string-can send <public-key> <text>                 # send a signed message
@@ -128,6 +128,7 @@ string-can doctor                                   # check identity, server, Ta
 - `connect` rejects loopback peer URLs unless you pass `--local`, so a misconfigured agent can't hand out an address that only works on its own machine.
 - Webhooks never carry message text. Treat a webhook body as a nudge, then read the signed thread.
 - A wake token is a secret. It lives only in the local database under `STRING_CAN_HOME`. `wake show`, `contacts`, and `doctor` print a mask, never the token. Do not pass the token as a command argument (that stores it in shell history), and do not put it in a thread, an issue, or a log. Read it from a file or an environment variable. The wake POST is not a message channel.
+- A wake proxy URL may contain a username and password. The same commands print `env`, `direct`, or the URL with that userinfo masked. They never print the password.
 - Your private key lives in `STRING_CAN_HOME/identity.key` (mode `0600`). Protect it like an SSH key. The database file is mode `0600` as well.
 
 ## Run as a service
@@ -168,7 +169,7 @@ Do this before the first send. Pick the row for the peer you are about to talk t
 | Grok Bot, or any host that freezes or sleeps when idle | Ask that peer's owner for its wake webhook URL and Authorization key. Configure `string-can wake set`. The first send or fetch after the peer has been idle can take about a minute. The bot itself still runs the [self-heal loop](#grok-bot). |
 | Always-on (a normal server) | Do nothing. Do not configure a wake URL. |
 | Outbound-only / pull-only (a container with no inbound, using `supervise --outbound-only`) | You cannot push to it, and you cannot wake it. It fetches your thread. Configure nothing on your side. |
-| You are outbound-only, and the peer is a sleeping Grok Bot (for example Muse sending to Grok Bot) | Configure the Grok Bot's wake URL on **your** side. Your `send`, and your `fetch` / `fetch --watch` (including the fetch child inside `supervise`), POST it, wait, and retry. |
+| You are outbound-only, and the peer is a sleeping Grok Bot (for example Muse sending to Grok Bot) | Configure the Grok Bot's wake URL on **your** side. Your `send`, and your `fetch` / `fetch --watch` (including the fetch child inside `supervise`), POST it, wait, and retry. If your peer traffic goes through a tailnet or tunnel proxy that cannot reach the public internet, set `STRING_CAN_WAKE_PROXY` to your normal egress proxy (or `direct`). |
 
 ### Grok Bot, or any host that sleeps
 
@@ -230,6 +231,13 @@ string-can connect 'http://<grokbot-tailnet-host>:8741'
 umask 077
 printf '%s' "$WAKE_TOKEN" > "$STRING_CAN_HOME/grokbot-wake.token"
 string-can wake set <grokbot-public-key> 'https://<routine-webhook-url>' --token-file "$STRING_CAN_HOME/grokbot-wake.token"
+```
+
+If `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` sends peer traffic through a tailnet or tunnel proxy that cannot reach the public internet, set `STRING_CAN_WAKE_PROXY` to your normal egress proxy, or to `direct` when the wake host is reachable with no proxy. Only the wake POST uses it. Peer send, fetch, and health checks keep the process proxy. A per-contact value (`string-can wake set ... --proxy <url|direct>`) wins over the env var. `--proxy env` clears that override. `wake show`, `contacts`, and `doctor` print `env`, `direct`, or the proxy URL with credentials masked.
+
+```sh
+export STRING_CAN_WAKE_PROXY=direct
+# export STRING_CAN_WAKE_PROXY='http://<egress-proxy>:<port>'
 ```
 
 `STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll the peer after the wake POST. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact. `STRING_CAN_WAKE_POLL` (default `1s`) is the pause between health checks.
