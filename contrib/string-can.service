@@ -1,5 +1,7 @@
 [Unit]
 Description=string-can agent mailbox
+# Inbound agents. Outbound-only agents should use string-can-supervise.service
+# instead (it keeps serve and fetch --watch alive). Do not enable both.
 After=network-online.target tailscaled.service
 Wants=network-online.target
 Wants=tailscaled.service

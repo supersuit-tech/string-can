@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -62,6 +63,14 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 		var stop context.CancelFunc
 		ctx, stop = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 		defer stop()
+		lk, lerr := dir.FetchLock(key)
+		if lerr != nil {
+			if errors.Is(lerr, home.ErrAlreadyWatching) {
+				return e.fail(fmt.Errorf("already watching %s", canon.ShortKey(key)))
+			}
+			return e.fail(lerr)
+		}
+		defer lk.Unlock()
 	}
 	for {
 		n, code := e.fetchOnce(ctx, st, c.BaseURL, ourKey, key)
@@ -310,10 +319,45 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 			fmt.Fprintf(e.stdout, "%s: reachable, mutual\n", line)
 		}
 	}
+	if dir.OutboundOnly() {
+		e.reportFetch(dir, contacts, &ok)
+	}
 	if !ok {
 		return 1
 	}
 	return 0
+}
+
+// reportFetch says whether fetch --watch is alive for each peer an
+// outbound-only agent must poll. serve retries outbound delivery; if it
+// dies and only fetch is up, sending stalls with no signal.
+func (e env) reportFetch(dir home.Dir, contacts []store.Contact, ok *bool) {
+	n := 0
+	for _, c := range contacts {
+		if c.BaseURL == "" {
+			continue
+		}
+		n++
+		name := c.Label
+		if name == "" {
+			name = canon.ShortKey(c.PublicKey)
+		}
+		watching, err := dir.Fetching(c.PublicKey)
+		if err != nil {
+			fmt.Fprintf(e.stdout, "fetch: %s (%v)\n", name, err)
+			*ok = false
+			continue
+		}
+		if !watching {
+			fmt.Fprintf(e.stdout, "fetch: %s not watching; run string-can supervise --outbound-only\n", name)
+			*ok = false
+			continue
+		}
+		fmt.Fprintf(e.stdout, "fetch: %s watching\n", name)
+	}
+	if n == 0 {
+		fmt.Fprintln(e.stdout, "fetch: no peers yet")
+	}
 }
 
 func (e env) reportTailnet(ctx context.Context, bindHost string, outbound bool, ok *bool) {

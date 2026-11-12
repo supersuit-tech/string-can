@@ -3,6 +3,7 @@ package home
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -203,6 +204,49 @@ func (l *Lock) Unlock() {
 func (d Dir) Serving() (bool, error) {
 	path := d.file(lockFile)
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return true, nil
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false, nil
+}
+
+// ErrAlreadyWatching means fetch --watch already holds the lock for this peer.
+var ErrAlreadyWatching = errors.New("already watching")
+
+func fetchLockName(pub string) string {
+	return "fetch-" + pub + ".lock"
+}
+
+// FetchLock takes the exclusive lock fetch --watch holds while polling pub.
+func (d Dir) FetchLock(pub string) (*Lock, error) {
+	if err := d.Ensure(); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(d.file(fetchLockName(pub)), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, ErrAlreadyWatching
+		}
+		return nil, err
+	}
+	return &Lock{f: f}, nil
+}
+
+// Fetching reports whether fetch --watch holds the lock for pub.
+func (d Dir) Fetching(pub string) (bool, error) {
+	f, err := os.OpenFile(d.file(fetchLockName(pub)), os.O_RDWR, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
