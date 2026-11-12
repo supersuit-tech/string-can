@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/supersuit-tech/string-can/internal/canon"
 	"github.com/supersuit-tech/string-can/internal/home"
 	"github.com/supersuit-tech/string-can/internal/listenaddr"
@@ -41,7 +42,7 @@ Usage:
   string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]
   string-can wake show <public-key>
   string-can wake clear <public-key>
-  string-can send [--auto] <public-key> <text>
+  string-can send [--auto] [--text-file <path>] <public-key> [<text>]
   string-can thread <public-key> [--since <id>]
   string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]
   string-can fetch <public-key> [--watch] [--every <duration>]
@@ -65,7 +66,14 @@ Environment:
 type env struct {
 	stdout io.Writer
 	stderr io.Writer
+	stdin  io.Reader
 }
+
+// sendUsageLine is the send command synopsis. Reply text belongs in a file
+// or on stdin so a shell does not expand $ before string-can sees it.
+const sendUsageLine = "string-can send [--auto] [--text-file <path>] <public-key> [<text>]"
+
+var errSendTextMissing = fmt.Errorf("message missing: pass <text>, --text-file <path>, or pipe the message on stdin")
 
 // Run executes the CLI and returns a process exit code.
 func Run(args []string) int {
@@ -74,15 +82,18 @@ func Run(args []string) int {
 
 // RunContext is Run with a context and streams, for tests.
 func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	e := env{stdout: stdout, stderr: stderr}
+	return (env{stdout: stdout, stderr: stderr, stdin: os.Stdin}).run(ctx, args)
+}
+
+func (e env) run(ctx context.Context, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
+		fmt.Fprint(e.stderr, usage)
 		return 2
 	}
 	cmd := args[0]
 	rest := args[1:]
 	if cmd == "-h" || cmd == "--help" || cmd == "help" {
-		fmt.Fprint(stdout, usage)
+		fmt.Fprint(e.stdout, usage)
 		return 0
 	}
 	switch cmd {
@@ -119,8 +130,8 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	case "doctor":
 		return e.cmdDoctor(ctx, rest)
 	default:
-		fmt.Fprintf(stderr, "string-can: unknown command %q\n", cmd)
-		fmt.Fprint(stderr, usage)
+		fmt.Fprintf(e.stderr, "string-can: unknown command %q\n", cmd)
+		fmt.Fprint(e.stderr, usage)
 		return 2
 	}
 }
@@ -342,9 +353,11 @@ func (e env) cmdContacts(args []string) int {
 
 func (e env) cmdSend(ctx context.Context, args []string) int {
 	var auto bool
+	var textFile string
 	fs := newFlagSet("send")
 	fs.BoolVar(&auto, "auto", false, "count this send as an auto-reply")
-	pos, help, err := parseWith(fs, args, nil)
+	fs.StringVar(&textFile, "text-file", "", "read the message from this file")
+	pos, help, err := parseWith(fs, args, map[string]bool{"text-file": true})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("send"))
 		return 0
@@ -352,14 +365,23 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
-	if len(pos) != 2 {
-		return e.fail(fmt.Errorf("usage: string-can send [--auto] <public-key> <text>"))
+	sawTextFile := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "text-file" {
+			sawTextFile = true
+		}
+	})
+	if sawTextFile && textFile == "" {
+		return e.fail(fmt.Errorf("--text-file path is empty"))
 	}
-	key, err := canon.NormalizeKey(pos[0])
+	keyText, text, err := e.sendText(pos, textFile)
 	if err != nil {
 		return e.fail(err)
 	}
-	text := pos[1]
+	key, err := canon.NormalizeKey(keyText)
+	if err != nil {
+		return e.fail(err)
+	}
 	if err := canon.CheckText(text); err != nil {
 		return e.fail(err)
 	}
@@ -456,6 +478,69 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 		fmt.Fprintf(e.stderr, "string-can: %s\n", detail)
 	}
 	return 0
+}
+
+// sendText takes the message from exactly one of <text>, --text-file, or stdin.
+// File and stdin bytes are the message as-is, including a trailing newline.
+func (e env) sendText(pos []string, textFile string) (key, text string, err error) {
+	if textFile != "" {
+		if len(pos) > 1 {
+			return "", "", fmt.Errorf("pass the message as <text> or --text-file, not both")
+		}
+		if len(pos) != 1 {
+			return "", "", fmt.Errorf("usage: %s", sendUsageLine)
+		}
+		text, err = readTextFile(textFile)
+		if err != nil {
+			return "", "", err
+		}
+		return pos[0], text, nil
+	}
+	switch len(pos) {
+	case 2:
+		return pos[0], pos[1], nil
+	case 1:
+		text, err = e.readSendStdin()
+		if err != nil {
+			return "", "", err
+		}
+		return pos[0], text, nil
+	default:
+		return "", "", fmt.Errorf("usage: %s", sendUsageLine)
+	}
+}
+
+func readTextFile(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("--text-file path is empty")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	return readCapped(f)
+}
+
+// isTerminal reports whether a file is a terminal. Tests replace it.
+var isTerminal = isatty.IsTerminal
+
+func (e env) readSendStdin() (string, error) {
+	if e.stdin == nil {
+		return "", errSendTextMissing
+	}
+	if f, ok := e.stdin.(*os.File); ok && isTerminal(f.Fd()) {
+		return "", errSendTextMissing
+	}
+	return readCapped(e.stdin)
+}
+
+func readCapped(r io.Reader) (string, error) {
+	b, err := io.ReadAll(io.LimitReader(r, int64(canon.MaxTextBytes)+1))
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 func (e env) cmdThread(args []string) int {
@@ -659,7 +744,7 @@ func commandHelp(name string) string {
 	case "wake":
 		return "usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]\n       string-can wake show <public-key>\n       string-can wake clear <public-key>\n"
 	case "send":
-		return "usage: string-can send [--auto] <public-key> <text>\n"
+		return "usage: " + sendUsageLine + "\n       Omit <text> and --text-file to read the message from stdin.\n"
 	case "thread":
 		return "usage: string-can thread <public-key> [--since <id>]\n"
 	case "inbox":

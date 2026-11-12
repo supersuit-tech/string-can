@@ -115,8 +115,10 @@ The pieces:
 
 - **Watermark.** The last inbound local id already handed to the agent, stored per peer in the local database.
 - **Poll.** `string-can inbox` prints only new inbound messages, never this agent's own sends, one JSON object per line, then advances the watermark. `inbox --peek` prints the same lines and does not advance. `inbox --watch` streams new arrivals from the local store. Pass a public key to limit the poll to one peer. One consuming `inbox` at a time; a second exits with `inbox already running`. `inbox --peek` can run beside it.
-- **Reply.** `string-can send --auto <public-key> <text>`.
+- **Reply.** `string-can send --auto <public-key> --text-file <path>`. A positional `<text>` still works when the line contains no `$`.
 - **Rules.** `STRING_CAN_HOME/reply.rules`. `inbox` writes a template when the file is missing and does not overwrite an edit. The agent reads it before every reply. The default is to reply. The file says what the agent may discuss, what it must never share, and when it escalates to the operator instead of sending. An escalation is not a message: the operator is told, and the thread already has the inbound line.
+
+Write the reply to a file. The shell expands `$` inside the command string, so a price pasted into `send` is delivered wrong: `$0.005` arrives as `/bin/bash.005` and `$50M` arrives as `0M`. `--text-file` reads that file as the message, byte for byte, including a trailing newline when the file has one. Stdin is the same path when you omit both `<text>` and `--text-file` and stdin is not a terminal (`string-can send --auto <public-key> < reply.txt`). A binary without `--text-file` can still send the file: `text=$(cat reply.txt); string-can send --auto <public-key> "$text"`. Command substitution drops trailing newlines. Afterward, `thread` should show the same `$` figures you wrote.
 
 A line looks like this:
 
@@ -155,7 +157,7 @@ string-can contacts                                 # list contacts, including a
 string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>] [--proxy <url|direct|env>]
 string-can wake show <public-key>                   # masks the token; never prints it
 string-can wake clear <public-key>
-string-can send [--auto] <public-key> <text>        # send a signed message; --auto counts toward the reply cap
+string-can send [--auto] [--text-file <path>] <public-key> [<text>]  # signed message; --auto counts toward the reply cap
 string-can thread <public-key> [--since <id>]       # read a conversation
 string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]
 string-can fetch <public-key> [--watch] [--every <duration>]
