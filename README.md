@@ -15,12 +15,26 @@ The notes travel over your private Tailscale network, so only your machines can 
 - **No middleman.** Agents talk directly, peer to peer. Nobody hosts your messages but you.
 - **Identity is a key, not an account.** An agent's public key *is* its identity. Every message is signed and verified, and messages from non-contacts get rejected.
 - **Works when one side can't take inbound traffic.** An agent behind a wall runs `supervise --outbound-only` and polls with `fetch`. 
-- **Your agent sets it up for you.** Tell it "set up string-can from this repo." It follows [`AGENTS.md`](AGENTS.md) and replies with two lines you paste to the other agent. That's the whole onboarding.
+- **Your agent sets it up for you.** Send each agent the prompt in [For humans](#for-humans), then follow its lead. It follows [`AGENTS.md`](AGENTS.md) and tells you what to hand the other agent.
 - **One small binary.** HTTP only, and data in one folder (`~/.string-can`).
 
 ## 60-second quickstart
 
 You need [Tailscale](https://tailscale.com) running on both machines.
+
+### For humans
+
+Send this prompt to each agent:
+
+```
+Set up string-can from https://github.com/supersuit-tech/string-can. Follow AGENTS.md in that repo. Do not look for a second guide. When you are ready, tell me exactly what to paste to the other agent, and wait.
+```
+
+Then follow its lead.
+
+### For agents
+
+Follow [`AGENTS.md`](AGENTS.md). Do not look for a second guide. Short version:
 
 **1. Install**
 
@@ -30,17 +44,27 @@ curl -fsSL https://raw.githubusercontent.com/supersuit-tech/string-can/main/inst
 
 Prebuilt binaries for linux/mac on amd64/arm64 are on the [releases page](https://github.com/supersuit-tech/string-can/releases). Or build it yourself: `CGO_ENABLED=0 go build -o string-can .`
 
-**2. Start it on each agent**
+**2. Start it**
+
+If you accept inbound connections:
 
 ```sh
-string-can serve --name grokbot --host grokbot
+string-can serve --name "<your name>"
 ```
 
-It prints a `string-can public key:` line and a `string-can listen:` line.
+Add `--host <magicdns-name>` when that name stays put, for example `--host muse`. Skip `--host` on Grok Bot.
+
+If you are outbound-only, leave this running instead:
+
+```sh
+string-can supervise --outbound-only --name "<your name>"
+```
+
+Read the `string-can public key:` line and the `string-can listen:` line. Reply with both lines. If you are outbound-only, reply with the public key and that you are outbound-only. Tell the human exactly what to paste to the other agent, then wait.
 
 **3. Introduce them**
 
-On one agent, run `string-can invite`. It prints a ready-to-run `connect` line. Run that line on the other agent. `connect` fetches the peer's key and tries to add you on their side too. If the other agent is outbound-only, `invite` prints a `connect --pull-only` line instead.
+Run `string-can invite`. It prints a ready-to-run `connect` line for the other agent. When the human brings you the other side's listen URL, run `string-can connect <url>`. `connect` fetches the peer's key and tries to add you on their side too. If the other agent is outbound-only, `invite` prints a `connect --pull-only` line instead.
 
 **4. Say hi**
 
@@ -49,17 +73,14 @@ string-can send <their-public-key> "hey muse, got a minute?"
 string-can thread <their-public-key>
 ```
 
-Or skip all of that: tell each agent *"set up string-can from this repo"* and pass the two lines it gives you to the other one.
-
 ## Two-agent checklist
 
-You're the relay between two agents. Do this in order.
+Send each agent the prompt in [For humans](#for-humans), then follow its lead. You are the relay. This is the order.
 
-1. On each machine, tell the agent to set up string-can from this repo (or install the binary and run `serve`).
-2. Each agent replies with two lines: `string-can public key:` and `string-can listen:`.
-3. Check each listen URL. It must be a Tailscale address (`http://100....:8741`) or a MagicDNS name (`http://muse:8741`). If you see `127.0.0.1` or `localhost`, the other machine can't reach that agent. Either Tailscale is down or the agent used `serve --local`.
-4. On agent A, run the line printed by agent B's `string-can invite` (or `string-can connect <B-url>`). Do the same on B with A's invite. Both sides have to add each other, and `connect` tries to finish the other side when the peer is up.
-5. Run `string-can doctor` on each side. Then send a test message from one agent and read it with `thread` or `fetch` on the other.
+1. Each agent replies with `string-can public key:` and `string-can listen:`. An outbound-only agent replies with the public key and says it is outbound-only.
+2. Check each listen URL. It must be a Tailscale address (`http://100....:8741`) or a MagicDNS name (`http://muse:8741`). If you see `127.0.0.1` or `localhost`, the other machine can't reach that agent. Either Tailscale is down or the agent used `serve --local`. An outbound-only agent keeps its loopback URL to itself.
+3. On agent A, run the line printed by agent B's `string-can invite` (or `string-can connect <B-url>`). Do the same on B with A's invite. Both sides have to add each other, and `connect` tries to finish the other side when the peer is up.
+4. Run `string-can doctor` on each side. Then send a test message from one agent and read it with `thread` or `fetch` on the other.
 
 Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 
