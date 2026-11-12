@@ -13,6 +13,8 @@ import (
 	sqlite "modernc.org/sqlite"
 )
 
+const messageCols = `id, peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged, last_error`
+
 // Contact is a saved peer.
 type Contact struct {
 	PublicKey  string
@@ -33,6 +35,7 @@ type Message struct {
 	Signature string
 	Delivered bool
 	Nudged    bool
+	LastError string
 }
 
 // Store is the SQLite-backed address book and message log.
@@ -74,13 +77,47 @@ CREATE TABLE IF NOT EXISTS messages (
 	signature TEXT NOT NULL,
 	delivered INTEGER NOT NULL,
 	nudged INTEGER NOT NULL,
+	last_error TEXT NOT NULL DEFAULT '',
 	UNIQUE(peer_pubkey, signature)
 );
 `); err != nil {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateMessages(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+func migrateMessages(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(messages)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	hasLastError := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "last_error" {
+			hasLastError = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasLastError {
+		_, err = db.Exec(`ALTER TABLE messages ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`)
+		return err
+	}
+	return nil
 }
 
 // Close closes the database.
@@ -177,9 +214,9 @@ func (s *Store) InsertMessage(m Message) (id int64, duplicate bool, err error) {
 		nudged = 1
 	}
 	res, err := s.db.Exec(`
-INSERT INTO messages (peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`, m.PeerPub, m.FromPub, m.Ts, m.Text, m.Body, m.Signature, delivered, nudged)
+INSERT INTO messages (peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged, last_error)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, m.PeerPub, m.FromPub, m.Ts, m.Text, m.Body, m.Signature, delivered, nudged, m.LastError)
 	if err != nil {
 		if isUnique(err) {
 			err = s.db.QueryRow(`
@@ -196,7 +233,7 @@ SELECT id FROM messages WHERE peer_pubkey = ? AND signature = ?
 // ListThread returns messages for peer with id > since, oldest first.
 func (s *Store) ListThread(peer string, since int64) ([]Message, error) {
 	rows, err := s.db.Query(`
-SELECT id, peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged
+SELECT `+messageCols+`
 FROM messages
 WHERE peer_pubkey = ? AND id > ?
 ORDER BY id ASC
@@ -235,7 +272,7 @@ func (s *Store) VerifiedThread(peer string, since int64) ([]Message, error) {
 // Undelivered returns outbound rows that the peer has not accepted.
 func (s *Store) Undelivered() ([]Message, error) {
 	rows, err := s.db.Query(`
-SELECT id, peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged
+SELECT ` + messageCols + `
 FROM messages
 WHERE delivered = 0
 ORDER BY id ASC
@@ -250,7 +287,7 @@ ORDER BY id ASC
 // UnnudgedInbound returns inbound rows that have not yet produced a webhook POST.
 func (s *Store) UnnudgedInbound() ([]Message, error) {
 	rows, err := s.db.Query(`
-SELECT id, peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged
+SELECT ` + messageCols + `
 FROM messages
 WHERE nudged = 0 AND peer_pubkey = from_pubkey
 ORDER BY id ASC
@@ -262,9 +299,15 @@ ORDER BY id ASC
 	return scanMessages(rows)
 }
 
-// MarkDelivered sets delivered = 1.
+// MarkDelivered sets delivered = 1 and clears last_error.
 func (s *Store) MarkDelivered(id int64) error {
-	_, err := s.db.Exec(`UPDATE messages SET delivered = 1 WHERE id = ?`, id)
+	_, err := s.db.Exec(`UPDATE messages SET delivered = 1, last_error = '' WHERE id = ?`, id)
+	return err
+}
+
+// SetLastError records the last delivery error for an outbound row.
+func (s *Store) SetLastError(id int64, msg string) error {
+	_, err := s.db.Exec(`UPDATE messages SET last_error = ? WHERE id = ?`, msg, id)
 	return err
 }
 
@@ -278,6 +321,13 @@ func (s *Store) MarkNudged(id int64) error {
 func (s *Store) CountMessages() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n)
+	return n, err
+}
+
+// CountPending returns the number of undelivered outbound rows.
+func (s *Store) CountPending() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE delivered = 0`).Scan(&n)
 	return n, err
 }
 
@@ -296,7 +346,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 func scanMessage(rows *sql.Rows) (Message, error) {
 	var m Message
 	var delivered, nudged int
-	err := rows.Scan(&m.ID, &m.PeerPub, &m.FromPub, &m.Ts, &m.Text, &m.Body, &m.Signature, &delivered, &nudged)
+	err := rows.Scan(&m.ID, &m.PeerPub, &m.FromPub, &m.Ts, &m.Text, &m.Body, &m.Signature, &delivered, &nudged, &m.LastError)
 	m.Delivered = delivered != 0
 	m.Nudged = nudged != 0
 	return m, err

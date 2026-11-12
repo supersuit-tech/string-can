@@ -1,0 +1,18 @@
+[Unit]
+Description=string-can agent mailbox
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/string-can serve
+Restart=on-failure
+RestartSec=5
+# Binds the Tailscale IPv4 address once tailscaled is up; serve waits if needed.
+Environment=STRING_CAN_HOME=%h/.string-can
+# Environment=STRING_CAN_WEBHOOK_URL=
+# Environment=STRING_CAN_WEBHOOK_TOKEN=
+
+[Install]
+WantedBy=default.target

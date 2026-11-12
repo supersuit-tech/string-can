@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -23,16 +22,24 @@ import (
 
 const usage = `string-can — signed messages between agents
 
+Both sides must add each other as contacts. Run string-can invite and give
+the printed connect command to the other agent, then connect to their URL.
+
 Usage:
   string-can pubkey
   string-can url
   string-can name <display-name>
-  string-can serve [--name <display-name>] [--port <port>]
-  string-can connect <public-key> <base-url> [--name <label>]
+  string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local]
+  string-can invite
+  string-can connect <url> [--name <label>] [--local]
+  string-can connect <public-key> <base-url> [--name <label>] [--local]
   string-can rename <public-key> <label>
   string-can contacts
   string-can send <public-key> <text>
   string-can thread <public-key> [--since <id>]
+  string-can fetch <public-key>
+  string-can status
+  string-can doctor
 
 Environment:
   STRING_CAN_HOME            data directory (default ~/.string-can)
@@ -72,6 +79,8 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return e.cmdName(rest)
 	case "serve":
 		return e.cmdServe(ctx, rest)
+	case "invite":
+		return e.cmdInvite(rest)
 	case "connect":
 		return e.cmdConnect(ctx, rest)
 	case "rename":
@@ -82,6 +91,12 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return e.cmdSend(ctx, rest)
 	case "thread":
 		return e.cmdThread(rest)
+	case "fetch":
+		return e.cmdFetch(ctx, rest)
+	case "status":
+		return e.cmdStatus(rest)
+	case "doctor":
+		return e.cmdDoctor(ctx, rest)
 	default:
 		fmt.Fprintf(stderr, "string-can: unknown command %q\n", cmd)
 		fmt.Fprint(stderr, usage)
@@ -125,10 +140,17 @@ func (e env) cmdURL(args []string) int {
 		return e.fail(err)
 	}
 	if u, err := dir.ListenURL(); err == nil && u != "" {
+		if listenaddr.IsLoopbackURL(u) {
+			fmt.Fprintln(e.stderr, "string-can: warning: listen URL is loopback; unreachable from other machines")
+		}
 		fmt.Fprintln(e.stdout, u)
 		return 0
 	}
-	fmt.Fprintln(e.stdout, listenaddr.WouldBind(listenaddr.DefaultPort))
+	u := listenaddr.WouldBind(listenaddr.DefaultPort)
+	if listenaddr.IsLoopbackURL(u) {
+		fmt.Fprintln(e.stderr, "string-can: warning: no Tailscale IPv4; this URL is loopback")
+	}
+	fmt.Fprintln(e.stdout, u)
 	return 0
 }
 
@@ -161,12 +183,15 @@ func (e env) cmdName(args []string) int {
 }
 
 func (e env) cmdServe(ctx context.Context, args []string) int {
-	var name string
+	var name, host string
+	var local bool
 	port := listenaddr.DefaultPort
 	fs := newFlagSet("serve")
 	fs.StringVar(&name, "name", "", "display name")
 	fs.IntVar(&port, "port", listenaddr.DefaultPort, "listen port")
-	pos, help, err := parseWith(fs, args, map[string]bool{"name": true, "port": true})
+	fs.StringVar(&host, "host", "", "advertised hostname (MagicDNS)")
+	fs.BoolVar(&local, "local", false, "bind to 127.0.0.1 for same-machine peers")
+	pos, help, err := parseWith(fs, args, map[string]bool{"name": true, "port": true, "host": true})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("serve"))
 		return 0
@@ -175,7 +200,7 @@ func (e env) cmdServe(ctx context.Context, args []string) int {
 		return e.fail(err)
 	}
 	if len(pos) != 0 {
-		return e.fail(fmt.Errorf("usage: string-can serve [--name <display-name>] [--port <port>]"))
+		return e.fail(fmt.Errorf("usage: string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local]"))
 	}
 	if port < 0 || port > 65535 {
 		return e.fail(fmt.Errorf("invalid port"))
@@ -184,93 +209,51 @@ func (e env) cmdServe(ctx context.Context, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	webhookURL := os.Getenv("STRING_CAN_WEBHOOK_URL")
+	webhookToken := os.Getenv("STRING_CAN_WEBHOOK_TOKEN")
 	srv, err := server.New(server.Config{
 		Home:         dir.Path,
 		Name:         name,
 		Port:         port,
-		WebhookURL:   os.Getenv("STRING_CAN_WEBHOOK_URL"),
-		WebhookToken: os.Getenv("STRING_CAN_WEBHOOK_TOKEN"),
+		Host:         host,
+		Local:        local,
+		WebhookURL:   webhookURL,
+		WebhookToken: webhookToken,
 	})
 	if err != nil {
 		return e.fail(err)
 	}
 	defer srv.Close()
-	if err := srv.Bind(); err != nil {
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := srv.BindContext(ctx); err != nil {
 		return e.fail(err)
 	}
 	fmt.Fprintf(e.stdout, "string-can public key: %s\n", srv.PublicKey())
 	fmt.Fprintf(e.stdout, "string-can listen: %s\n", srv.BaseURL())
+	if listenaddr.IsLoopbackURL(srv.BaseURL()) {
+		fmt.Fprintln(e.stderr, "string-can: warning: bound to 127.0.0.1; unreachable from other machines. Pass --local only for two agents on one host.")
+	}
+	e.printWebhookStatus(ctx, webhookURL, webhookToken)
 	if f, ok := e.stdout.(*os.File); ok {
 		_ = f.Sync()
 	}
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	if err := srv.Serve(ctx); err != nil {
 		return e.fail(err)
 	}
 	return 0
 }
 
-func (e env) cmdConnect(ctx context.Context, args []string) int {
-	var label string
-	fs := newFlagSet("connect")
-	fs.StringVar(&label, "name", "", "local label for this contact")
-	pos, help, err := parseWith(fs, args, map[string]bool{"name": true})
-	if help {
-		fmt.Fprint(e.stdout, commandHelp("connect"))
-		return 0
+func (e env) printWebhookStatus(ctx context.Context, webhookURL, token string) {
+	if webhookURL == "" {
+		fmt.Fprintln(e.stderr, "string-can webhook: not set")
+		return
 	}
-	if err != nil {
-		return e.fail(err)
+	if err := push.SelfTest(ctx, push.DefaultClient(), webhookURL, token); err != nil {
+		fmt.Fprintf(e.stderr, "string-can webhook: configured, self-test failed: %v\n", err)
+		return
 	}
-	if len(pos) != 2 {
-		return e.fail(fmt.Errorf("usage: string-can connect <public-key> <base-url> [--name <label>]"))
-	}
-	key, err := canon.NormalizeKey(pos[0])
-	if err != nil {
-		return e.fail(err)
-	}
-	baseURL, err := normalizeBaseURL(pos[1])
-	if err != nil {
-		return e.fail(err)
-	}
-	stated, reachable, mismatch, err := probePeer(ctx, baseURL, key)
-	if err != nil {
-		return e.fail(err)
-	}
-	if mismatch {
-		return e.fail(fmt.Errorf("peer public key mismatch"))
-	}
-	if label == "" {
-		if reachable && stated != "" {
-			label = stated
-		} else {
-			label = canon.ShortKey(key)
-		}
-	}
-	st, _, err := openStore()
-	if err != nil {
-		return e.fail(err)
-	}
-	defer st.Close()
-	c := store.Contact{
-		PublicKey:  key,
-		Label:      label,
-		BaseURL:    baseURL,
-		StatedName: stated,
-	}
-	if err := st.UpsertContact(c); err != nil {
-		return e.fail(err)
-	}
-	if !reachable {
-		fmt.Fprintln(e.stderr, "string-can: peer was not reachable yet")
-	}
-	return e.writeJSON(contactJSON{
-		Label:      c.Label,
-		PublicKey:  c.PublicKey,
-		BaseURL:    c.BaseURL,
-		StatedName: c.StatedName,
-	})
+	fmt.Fprintln(e.stderr, "string-can webhook: configured, self-test ok")
 }
 
 func (e env) cmdRename(args []string) int {
@@ -397,7 +380,9 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 		return e.fail(err)
 	}
 	if err := push.Message(ctx, push.DefaultClient(), c.BaseURL, from, sig, body); err != nil {
+		_ = st.SetLastError(id, err.Error())
 		fmt.Fprintf(e.stdout, "sent %d pending\n", id)
+		fmt.Fprintf(e.stderr, "string-can: %v\n", err)
 		return 0
 	}
 	if err := st.MarkDelivered(id); err != nil {
@@ -477,54 +462,6 @@ func openStore() (*store.Store, home.Dir, error) {
 	}
 	st, err := store.Open(dir.DBPath())
 	return st, dir, err
-}
-
-func probePeer(ctx context.Context, baseURL, wantKey string) (stated string, reachable, mismatch bool, err error) {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/", nil)
-	if err != nil {
-		return "", false, false, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", false, false, nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", false, false, nil
-	}
-	var info struct {
-		Name      string `json:"name"`
-		PublicKey string `json:"public_key"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return "", false, false, nil
-	}
-	if info.PublicKey == "" {
-		return "", false, false, nil
-	}
-	got, nerr := canon.NormalizeKey(info.PublicKey)
-	if nerr != nil || got != wantKey {
-		return "", false, true, nil
-	}
-	return info.Name, true, false, nil
-}
-
-func normalizeBaseURL(s string) (string, error) {
-	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, "http://") {
-		return "", fmt.Errorf("base URL must start with http://")
-	}
-	s = strings.TrimRight(s, "/")
-	if s == "http://" {
-		return "", fmt.Errorf("base URL must start with http://")
-	}
-	rest := strings.TrimPrefix(s, "http://")
-	if rest == "" || strings.Contains(rest, "://") {
-		return "", fmt.Errorf("base URL must start with http://")
-	}
-	return s, nil
 }
 
 func newFlagSet(name string) *flag.FlagSet {
@@ -615,9 +552,11 @@ func commandHelp(name string) string {
 	case "name":
 		return "usage: string-can name <display-name>\n"
 	case "serve":
-		return "usage: string-can serve [--name <display-name>] [--port <port>]\n"
+		return "usage: string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local]\n"
+	case "invite":
+		return "usage: string-can invite\n"
 	case "connect":
-		return "usage: string-can connect <public-key> <base-url> [--name <label>]\n"
+		return "usage: string-can connect <url> [--name <label>] [--local]\n       string-can connect <public-key> <base-url> [--name <label>] [--local]\n"
 	case "rename":
 		return "usage: string-can rename <public-key> <label>\n"
 	case "contacts":
@@ -626,6 +565,12 @@ func commandHelp(name string) string {
 		return "usage: string-can send <public-key> <text>\n"
 	case "thread":
 		return "usage: string-can thread <public-key> [--since <id>]\n"
+	case "fetch":
+		return "usage: string-can fetch <public-key>\n"
+	case "status":
+		return "usage: string-can status\n"
+	case "doctor":
+		return "usage: string-can doctor\n"
 	default:
 		return usage
 	}
