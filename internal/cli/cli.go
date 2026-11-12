@@ -45,6 +45,7 @@ Environment:
   STRING_CAN_HOME            data directory (default ~/.string-can)
   STRING_CAN_WEBHOOK_URL     POST target for inbound wake-ups
   STRING_CAN_WEBHOOK_TOKEN   Bearer token for the webhook
+  STRING_CAN_PEER_TIMEOUT    deadline for one send or thread check (default 20s)
 `
 
 type env struct {
@@ -379,16 +380,34 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
-	if err := push.Message(ctx, push.DefaultClient(), c.BaseURL, from, sig, body); err != nil {
-		_ = st.SetLastError(id, err.Error())
+	res := push.Deliver(ctx, push.PeerClient(), c.BaseURL, from, sig, body, push.DeliverOptions{})
+	switch res.Kind {
+	case push.KindDelivered:
+		if err := st.MarkDelivered(id); err != nil {
+			return e.fail(err)
+		}
+		fmt.Fprintf(e.stdout, "sent %d\n", id)
+	case push.KindUnconfirmed:
+		detail := res.Detail
+		if detail == "" {
+			detail = push.UnconfirmedDetail
+		}
+		next := time.Now().Add(push.RetryDelay(1)).UnixMilli()
+		_ = st.RecordOutcome(id, store.StateUnconfirmed, detail, 1, next)
+		fmt.Fprintf(e.stdout, "sent %d (unconfirmed — %s)\n", id, detail)
+	default:
+		detail := res.Detail
+		if detail == "" && res.Err != nil {
+			detail = res.Err.Error()
+		}
+		if detail == "" {
+			detail = "delivery failed"
+		}
+		next := time.Now().Add(push.RetryDelay(1)).UnixMilli()
+		_ = st.RecordOutcome(id, "", detail, 1, next)
 		fmt.Fprintf(e.stdout, "sent %d pending\n", id)
-		fmt.Fprintf(e.stderr, "string-can: %v\n", err)
-		return 0
+		fmt.Fprintf(e.stderr, "string-can: %s\n", detail)
 	}
-	if err := st.MarkDelivered(id); err != nil {
-		return e.fail(err)
-	}
-	fmt.Fprintf(e.stdout, "sent %d\n", id)
 	return 0
 }
 

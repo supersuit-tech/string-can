@@ -4,19 +4,71 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
 // ForbiddenContact is the actionable 403 explanation.
 const ForbiddenContact = "peer rejected the message: it hasn't added you as a contact yet; ask them to run connect with your URL"
 
-// DefaultClient is used for peer POSTs and webhooks.
+// UnconfirmedDetail is the user-facing note when a response was lost.
+// The peer may already have stored the message.
+const UnconfirmedDetail = "response timed out, will verify"
+
+// AbsentDetail is the user-facing note when a lost response was checked
+// and the peer's thread does not contain the message.
+const AbsentDetail = "response timed out and the peer does not have the message"
+
+const defaultPeerTimeout = 20 * time.Second
+
+// DefaultClient is used for probes and webhooks.
 func DefaultClient() *http.Client {
 	return &http.Client{Timeout: 5 * time.Second}
+}
+
+// PeerClient is used for message delivery and the thread check that follows
+// a lost response. STRING_CAN_PEER_TIMEOUT overrides the default (20s),
+// as a Go duration such as "30s".
+func PeerClient() *http.Client {
+	return &http.Client{Timeout: peerTimeout()}
+}
+
+func peerTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("STRING_CAN_PEER_TIMEOUT"))
+	if raw == "" {
+		return defaultPeerTimeout
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultPeerTimeout
+	}
+	return d
+}
+
+// RetryDelay is the wait after the n-th failed delivery attempt (1-based):
+// 5s, 15s, 30s, then 60s.
+func RetryDelay(failures int) time.Duration {
+	steps := [...]time.Duration{
+		5 * time.Second,
+		15 * time.Second,
+		30 * time.Second,
+		60 * time.Second,
+	}
+	if failures <= 1 {
+		return steps[0]
+	}
+	i := failures - 1
+	if i >= len(steps) {
+		i = len(steps) - 1
+	}
+	return steps[i]
 }
 
 // HTTPError is a non-success status from a peer or webhook.
@@ -38,7 +90,7 @@ func (e *HTTPError) Error() string {
 // Message POSTs a signed canonical body to the peer. 200 and 201 count as success.
 func Message(ctx context.Context, client *http.Client, baseURL, fromPub, signature string, body []byte) error {
 	if client == nil {
-		client = DefaultClient()
+		client = PeerClient()
 	}
 	u := strings.TrimRight(baseURL, "/") + "/" + fromPub
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
@@ -84,6 +136,140 @@ func asHTTPError(err error, target **HTTPError) bool {
 	return true
 }
 
+// Kind is how a delivery attempt ended.
+type Kind int
+
+const (
+	// KindDelivered means the peer accepted the message or already has it.
+	KindDelivered Kind = iota + 1
+	// KindPending means the peer did not accept the message.
+	KindPending
+	// KindUnconfirmed means the request may have arrived and the response was lost.
+	KindUnconfirmed
+)
+
+// Outcome is the result of Deliver.
+type Outcome struct {
+	Kind Kind
+	Err  error
+	// Detail is safe to show to a user. Timeouts are rewritten; a refused
+	// connection or an HTTP error is quoted as the peer reported it.
+	Detail string
+	// Found is true when the peer's thread contained the signature.
+	Found bool
+	// Absent is true when the thread was read and the signature was not there.
+	Absent bool
+}
+
+// DeliverOptions controls Deliver.
+type DeliverOptions struct {
+	// VerifyFirst reads the peer's thread before POSTing. Used when an
+	// earlier attempt timed out, so a retry does not POST a message the
+	// peer already stored.
+	VerifyFirst bool
+}
+
+// Deliver POSTs a signed message. A timeout or a dropped response is not
+// treated as failure until the peer's thread has been checked for the
+// signature. Connection refused, DNS failure, no route, and an HTTP error
+// status are pending: the peer did not accept this attempt.
+func Deliver(ctx context.Context, client *http.Client, baseURL, fromPub, signature string, body []byte, opt DeliverOptions) Outcome {
+	if client == nil {
+		client = PeerClient()
+	}
+	absent := false
+	if opt.VerifyFirst && ctx.Err() == nil {
+		found, err := signatureOnThread(ctx, client, baseURL, fromPub, signature)
+		if err != nil {
+			return Outcome{Kind: KindUnconfirmed, Err: err, Detail: verifyDetail(err)}
+		}
+		if found {
+			return Outcome{Kind: KindDelivered, Found: true}
+		}
+		absent = true
+	}
+	err := Message(ctx, client, baseURL, fromPub, signature, body)
+	if err == nil {
+		return Outcome{Kind: KindDelivered, Absent: absent}
+	}
+	if IsAmbiguous(err) && ctx.Err() == nil {
+		found, verr := signatureOnThread(ctx, client, baseURL, fromPub, signature)
+		if verr != nil {
+			return Outcome{Kind: KindUnconfirmed, Err: err, Detail: verifyDetail(verr)}
+		}
+		if found {
+			return Outcome{Kind: KindDelivered, Found: true}
+		}
+		return Outcome{Kind: KindPending, Err: err, Detail: AbsentDetail, Absent: true}
+	}
+	if IsAmbiguous(err) {
+		return Outcome{Kind: KindUnconfirmed, Err: err, Detail: UnconfirmedDetail}
+	}
+	return Outcome{Kind: KindPending, Err: err, Detail: definiteDetail(err), Absent: absent}
+}
+
+// IsAmbiguous reports whether err means the request may have been processed
+// and the response was lost. A timeout, a reset while waiting for the
+// response, or a closed connection is ambiguous. Connection refused, DNS
+// failure, no route, and an HTTP error status are not: those mean the peer
+// did not accept the message.
+func IsAmbiguous(err error) bool {
+	if err == nil {
+		return false
+	}
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "awaiting headers"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "timeout"):
+		return true
+	default:
+		return false
+	}
+}
+
+func signatureOnThread(ctx context.Context, client *http.Client, baseURL, ourPub, signature string) (bool, error) {
+	msgs, err := Thread(ctx, client, baseURL, ourPub)
+	if err != nil {
+		return false, err
+	}
+	for _, m := range msgs {
+		if m.Signature == signature {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func verifyDetail(err error) string {
+	if err == nil || IsAmbiguous(err) {
+		return UnconfirmedDetail
+	}
+	return "could not verify delivery: " + err.Error()
+}
+
+func definiteDetail(err error) string {
+	if err == nil {
+		return "delivery failed"
+	}
+	return err.Error()
+}
+
 // RemoteMessage is one entry from a peer's GET thread.
 type RemoteMessage struct {
 	ID        int64  `json:"id"`
@@ -96,7 +282,7 @@ type RemoteMessage struct {
 // Thread GETs the peer's copy of the conversation with us.
 func Thread(ctx context.Context, client *http.Client, baseURL, ourPub string) ([]RemoteMessage, error) {
 	if client == nil {
-		client = DefaultClient()
+		client = PeerClient()
 	}
 	u := strings.TrimRight(baseURL, "/") + "/" + ourPub
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

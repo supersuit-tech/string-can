@@ -173,6 +173,9 @@ func TestForbiddenIsActionable(t *testing.T) {
 	if !strings.Contains(status, `"last_error":"`) || !strings.Contains(status, "hasn") {
 		t.Fatalf("status %s", status)
 	}
+	if !strings.Contains(status, `"state":"pending"`) {
+		t.Fatalf("status state: %s", status)
+	}
 }
 
 func TestFetchPullsPeerThread(t *testing.T) {

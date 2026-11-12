@@ -13,7 +13,12 @@ import (
 	sqlite "modernc.org/sqlite"
 )
 
-const messageCols = `id, peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged, last_error`
+const messageCols = `id, peer_pubkey, from_pubkey, ts, text, body, signature, delivered, nudged, last_error, delivery_state, attempts, next_attempt`
+
+// StateUnconfirmed means a send was attempted and the response was lost.
+// The peer may already have the message. Empty delivery_state means the
+// peer did not accept it (or it has not been attempted yet).
+const StateUnconfirmed = "unconfirmed"
 
 // Contact is a saved peer.
 type Contact struct {
@@ -36,6 +41,13 @@ type Message struct {
 	Delivered bool
 	Nudged    bool
 	LastError string
+	// State is "" or StateUnconfirmed.
+	State string
+	// Attempts is how many delivery attempts have failed.
+	Attempts int
+	// NextAttempt is the unix-milli time before which a retry should wait.
+	// Zero means the row is eligible immediately.
+	NextAttempt int64
 }
 
 // Store is the SQLite-backed address book and message log.
@@ -78,6 +90,9 @@ CREATE TABLE IF NOT EXISTS messages (
 	delivered INTEGER NOT NULL,
 	nudged INTEGER NOT NULL,
 	last_error TEXT NOT NULL DEFAULT '',
+	delivery_state TEXT NOT NULL DEFAULT '',
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_attempt INTEGER NOT NULL DEFAULT 0,
 	UNIQUE(peer_pubkey, signature)
 );
 `); err != nil {
@@ -92,32 +107,48 @@ CREATE TABLE IF NOT EXISTS messages (
 }
 
 func migrateMessages(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(messages)`)
+	cols, err := columnSet(db, "messages")
 	if err != nil {
 		return err
 	}
+	alters := []struct {
+		name string
+		sql  string
+	}{
+		{"last_error", `ALTER TABLE messages ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`},
+		{"delivery_state", `ALTER TABLE messages ADD COLUMN delivery_state TEXT NOT NULL DEFAULT ''`},
+		{"attempts", `ALTER TABLE messages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`},
+		{"next_attempt", `ALTER TABLE messages ADD COLUMN next_attempt INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, alt := range alters {
+		if cols[alt.name] {
+			continue
+		}
+		if _, err := db.Exec(alt.sql); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func columnSet(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
-	hasLastError := false
+	cols := map[string]bool{}
 	for rows.Next() {
 		var cid int
 		var name, ctype string
 		var notnull, pk int
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return err
+			return nil, err
 		}
-		if name == "last_error" {
-			hasLastError = true
-		}
+		cols[name] = true
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if !hasLastError {
-		_, err = db.Exec(`ALTER TABLE messages ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`)
-		return err
-	}
-	return nil
+	return cols, rows.Err()
 }
 
 // Close closes the database.
@@ -299,15 +330,31 @@ ORDER BY id ASC
 	return scanMessages(rows)
 }
 
-// MarkDelivered sets delivered = 1 and clears last_error.
+// MarkDelivered sets delivered = 1 and clears the delivery error and retry schedule.
 func (s *Store) MarkDelivered(id int64) error {
-	_, err := s.db.Exec(`UPDATE messages SET delivered = 1, last_error = '' WHERE id = ?`, id)
+	_, err := s.db.Exec(`
+UPDATE messages
+SET delivered = 1, last_error = '', delivery_state = '', attempts = 0, next_attempt = 0
+WHERE id = ?
+`, id)
 	return err
 }
 
 // SetLastError records the last delivery error for an outbound row.
 func (s *Store) SetLastError(id int64, msg string) error {
 	_, err := s.db.Exec(`UPDATE messages SET last_error = ? WHERE id = ?`, msg, id)
+	return err
+}
+
+// RecordOutcome stores a failed or unconfirmed delivery attempt.
+// state is "" (peer did not accept it) or StateUnconfirmed.
+// nextAttempt is unix milliseconds; the wake loop waits until then.
+func (s *Store) RecordOutcome(id int64, state, lastError string, attempts int, nextAttempt int64) error {
+	_, err := s.db.Exec(`
+UPDATE messages
+SET delivery_state = ?, last_error = ?, attempts = ?, next_attempt = ?
+WHERE id = ?
+`, state, lastError, attempts, nextAttempt, id)
 	return err
 }
 
@@ -331,6 +378,13 @@ func (s *Store) CountPending() (int64, error) {
 	return n, err
 }
 
+// CountUnconfirmed returns undelivered rows whose response was lost.
+func (s *Store) CountUnconfirmed() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE delivered = 0 AND delivery_state = ?`, StateUnconfirmed).Scan(&n)
+	return n, err
+}
+
 func scanMessages(rows *sql.Rows) ([]Message, error) {
 	var out []Message
 	for rows.Next() {
@@ -346,7 +400,10 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 func scanMessage(rows *sql.Rows) (Message, error) {
 	var m Message
 	var delivered, nudged int
-	err := rows.Scan(&m.ID, &m.PeerPub, &m.FromPub, &m.Ts, &m.Text, &m.Body, &m.Signature, &delivered, &nudged, &m.LastError)
+	err := rows.Scan(
+		&m.ID, &m.PeerPub, &m.FromPub, &m.Ts, &m.Text, &m.Body, &m.Signature,
+		&delivered, &nudged, &m.LastError, &m.State, &m.Attempts, &m.NextAttempt,
+	)
 	m.Delivered = delivered != 0
 	m.Nudged = nudged != 0
 	return m, err

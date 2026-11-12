@@ -59,4 +59,17 @@ VALUES (?, ?, 1, 'x', '{}', 'sig', 0, 0)
 	if len(msgs) != 1 || msgs[0].LastError != "later" {
 		t.Fatalf("%+v", msgs)
 	}
+	if err := st.RecordOutcome(1, StateUnconfirmed, "response timed out, will verify", 2, 99); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err = st.Undelivered()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].State != StateUnconfirmed || msgs[0].Attempts != 2 || msgs[0].NextAttempt != 99 {
+		t.Fatalf("%+v", msgs)
+	}
+	if n, err := st.CountUnconfirmed(); err != nil || n != 1 {
+		t.Fatalf("unconfirmed %d %v", n, err)
+	}
 }

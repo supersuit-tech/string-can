@@ -299,15 +299,32 @@ func TestOutboundRetry(t *testing.T) {
 	if !strings.Contains(out, "pending") {
 		t.Fatalf("expected pending, got %q", out)
 	}
+	if strings.Contains(out, "unconfirmed") {
+		t.Fatalf("connection refused is not unconfirmed: %q", out)
+	}
 	if countMessages(t, homeA) != 1 {
 		t.Fatal("A should store the outbound row")
+	}
+	pending := undelivered(t, homeA)
+	if len(pending) != 1 || pending[0].NextAttempt <= time.Now().UnixMilli() {
+		t.Fatalf("expected a future retry, got %+v", pending)
 	}
 
 	startServer(t, homeB, "beta", bPort, "", "")
 	a.Tick(context.Background())
+	if msgs := undelivered(t, homeA); len(msgs) != 1 {
+		t.Fatalf("retry ran before backoff: %+v", msgs)
+	}
+	if err := a.Store().RecordOutcome(pending[0].ID, pending[0].State, pending[0].LastError, pending[0].Attempts, 0); err != nil {
+		t.Fatal(err)
+	}
+	a.Tick(context.Background())
 	threadB := run(t, homeB, 0, "thread", a.PublicKey())
 	if !strings.Contains(threadB, `"text":"later"`) {
 		t.Fatalf("B missing delivered message: %s", threadB)
+	}
+	if msgs := undelivered(t, homeA); len(msgs) != 0 {
+		t.Fatalf("still undelivered: %+v", msgs)
 	}
 }
 
@@ -483,6 +500,20 @@ func waitURL(t *testing.T, u string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("server at %s did not become ready", u)
+}
+
+func undelivered(t *testing.T, homeDir string) []store.Message {
+	t.Helper()
+	st, err := store.Open(filepath.Join(homeDir, "string-can.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	msgs, err := st.Undelivered()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msgs
 }
 
 func mustPort(t *testing.T, u string) int {

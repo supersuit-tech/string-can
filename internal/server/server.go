@@ -52,6 +52,7 @@ type Server struct {
 	webhookURL    string
 	webhookToken  string
 	client        *http.Client
+	peerClient    *http.Client
 	log           *log.Logger
 
 	lock          *home.Lock
@@ -96,8 +97,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.WakeEvery == 0 {
 		cfg.WakeEvery = 5 * time.Second
 	}
+	nudgeClient := cfg.HTTPClient
+	peerClient := cfg.HTTPClient
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = push.DefaultClient()
+		nudgeClient = push.DefaultClient()
+		peerClient = push.PeerClient()
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -115,7 +119,8 @@ func New(cfg Config) (*Server, error) {
 		tailscaleWait: cfg.TailscaleWait,
 		webhookURL:    cfg.WebhookURL,
 		webhookToken:  cfg.WebhookToken,
-		client:        cfg.HTTPClient,
+		client:        nudgeClient,
+		peerClient:    peerClient,
 		log:           logger,
 	}, nil
 }
@@ -322,22 +327,70 @@ func (s *Server) retryOutbound(ctx context.Context) {
 		s.log.Printf("wake: list undelivered: %v", err)
 		return
 	}
+	now := time.Now().UnixMilli()
 	for _, m := range msgs {
+		if ctx.Err() != nil {
+			return
+		}
+		if m.NextAttempt > now {
+			continue
+		}
 		c, err := s.store.GetContact(m.PeerPub)
 		if err != nil {
 			continue
 		}
-		if err := push.Message(ctx, s.client, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body)); err != nil {
-			s.log.Printf("wake: deliver id=%d: %v", m.ID, err)
-			if serr := s.store.SetLastError(m.ID, err.Error()); serr != nil {
-				s.log.Printf("wake: save last_error id=%d: %v", m.ID, serr)
+		// A previous timeout is not proof the peer missed the message.
+		// Read the thread before POSTing again.
+		res := push.Deliver(ctx, s.peerClient, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body), push.DeliverOptions{
+			VerifyFirst: m.State == store.StateUnconfirmed,
+		})
+		switch res.Kind {
+		case push.KindDelivered:
+			if err := s.store.MarkDelivered(m.ID); err != nil {
+				s.log.Printf("wake: mark delivered id=%d: %v", m.ID, err)
+				continue
 			}
-			continue
-		}
-		if err := s.store.MarkDelivered(m.ID); err != nil {
-			s.log.Printf("wake: mark delivered id=%d: %v", m.ID, err)
+			if res.Found {
+				s.log.Printf("wake: id=%d verified delivered", m.ID)
+			} else {
+				s.log.Printf("wake: id=%d delivered", m.ID)
+			}
+		case push.KindUnconfirmed:
+			s.recordFailure(m, store.StateUnconfirmed, outcomeDetail(res))
+			s.log.Printf("wake: id=%d unconfirmed", m.ID)
+		case push.KindPending:
+			detail := outcomeDetail(res)
+			s.recordFailure(m, "", detail)
+			if res.Absent {
+				s.log.Printf("wake: id=%d verified not delivered: %s", m.ID, detail)
+			} else {
+				s.log.Printf("wake: id=%d deliver failed: %s", m.ID, detail)
+			}
+		default:
+			s.log.Printf("wake: id=%d unknown delivery outcome", m.ID)
 		}
 	}
+}
+
+func (s *Server) recordFailure(m store.Message, state, detail string) {
+	attempts := m.Attempts + 1
+	next := time.Now().Add(push.RetryDelay(attempts)).UnixMilli()
+	if err := s.store.RecordOutcome(m.ID, state, detail, attempts, next); err != nil {
+		s.log.Printf("wake: save outcome id=%d: %v", m.ID, err)
+	}
+}
+
+func outcomeDetail(res push.Outcome) string {
+	if res.Detail != "" {
+		return res.Detail
+	}
+	if res.Err != nil {
+		return res.Err.Error()
+	}
+	if res.Kind == push.KindUnconfirmed {
+		return push.UnconfirmedDetail
+	}
+	return "delivery failed"
 }
 
 func (s *Server) nudgeInbound(ctx context.Context) {
