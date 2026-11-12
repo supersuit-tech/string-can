@@ -135,7 +135,17 @@ Any outbound-only agent runs `string-can supervise --outbound-only` continuously
 
 The Grok Bot Tailscale plugin is outbound-only and MCP-only: it can reach MCP servers on your tailnet, but it does not carry plain HTTP and nothing on the tailnet can connect in. string-can needs inbound, so **run your own `tailscaled` on the Grok Bot computer**. Do not use the plugin for this.
 
-The Grok Bot node's network periodically drops its long-poll to Tailscale's coordination server. The 100.x IP stays assigned, so `string-can serve` looks healthy, but `tailscale status --json` shows `Self.Online=false` and peers cannot reach you. Run [`contrib/ts-selfheal.sh`](contrib/ts-selfheal.sh) in a shell on the box (it costs no Grok Bot usage). After ~3 minutes offline it restarts `tailscaled` and `serve`. A full reset of the Grok Bot computer kills background processes, so have the bot re-launch the loop (a daily check is enough).
+**Every Grok Bot node must run [`contrib/ts-selfheal.sh`](contrib/ts-selfheal.sh).** That loop is the default, required setup. Set `TAILSCALED_START` to the command that starts `tailscaled`, then launch the script with `nohup` from a login shell:
+
+```sh
+nohup bash -lc ./contrib/ts-selfheal.sh >> ~/.string-can-selfheal.log 2>&1 &
+```
+
+A computer reset kills background processes, so launch it again after any reset. A daily check is enough. The loop costs no Grok Bot usage.
+
+The Grok Bot computer is a microVM that gets frozen and snapshotted over and over. Outbound traffic goes through a sandbox egress proxy that forgets connections while the guest is frozen and sends no reset, so tailscaled's connection to the coordination server dies quietly. tailscaled notices the long-poll timeout and then keeps reusing that dead connection until the kernel gives up, about 15 minutes later. The 100.x address stays assigned, `serve` still looks healthy, and `tailscale status --json` shows `Self.Online=false`, so peers cannot reach the node. This is [tailscale#12021](https://github.com/tailscale/tailscale/issues/12021). The fix in [tailscale#21834](https://github.com/tailscale/tailscale/pull/21834) was still unmerged and unreleased as of Nov 12, 2026. While the VM is frozen, nothing can keep the node reachable. Peers running fetch retries pick the messages up later.
+
+The loop closes tailscaled's established TCP port 443 sockets after about 20 seconds offline, again after about 60 seconds, and as soon as the VM wakes from a freeze. tailscaled redials and is online again in seconds, with `tailscaled` and `string-can` left running. If the node is still offline after about 120 seconds, the loop restarts `tailscaled` and `serve`. Each online/offline transition is appended to `~/.local/tailscale/selfheal.log`.
 
 Keep `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` as Grok Bot secrets, and start `serve` from a login shell (`bash -lc`) so it sees them.
 
