@@ -30,6 +30,7 @@ Usage:
   string-can url
   string-can name <display-name>
   string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]
+  string-can supervise [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>] [--every <duration>] [public-key...]
   string-can invite
   string-can connect <url> [--name <label>] [--local] [--pull-only]
   string-can connect <public-key> <base-url> [--name <label>] [--local] [--pull-only]
@@ -81,6 +82,8 @@ func RunContext(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return e.cmdName(rest)
 	case "serve":
 		return e.cmdServe(ctx, rest)
+	case "supervise":
+		return e.cmdSupervise(ctx, rest)
 	case "invite":
 		return e.cmdInvite(rest)
 	case "connect":
@@ -590,6 +593,8 @@ func commandHelp(name string) string {
 		return "usage: string-can name <display-name>\n"
 	case "serve":
 		return "usage: string-can serve [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]\n"
+	case "supervise":
+		return "usage: string-can supervise [--name <display-name>] [--port <port>] [--host <name>] [--local] [--outbound-only] [--wait <duration>] [--every <duration>] [public-key...]\n"
 	case "invite":
 		return "usage: string-can invite\n"
 	case "connect":

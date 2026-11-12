@@ -18,6 +18,7 @@ import (
 
 	"github.com/supersuit-tech/string-can/internal/canon"
 	"github.com/supersuit-tech/string-can/internal/cli"
+	"github.com/supersuit-tech/string-can/internal/home"
 	"github.com/supersuit-tech/string-can/internal/listenaddr"
 	"github.com/supersuit-tech/string-can/internal/push"
 	"github.com/supersuit-tech/string-can/internal/server"
@@ -519,6 +520,32 @@ func TestHandshakeOutboundOnlyLoopbackFromRemote(t *testing.T) {
 	c, err := srv.Store().GetContact(from)
 	if err != nil || !c.PullOnly {
 		t.Fatalf("contact %+v %v", c, err)
+	}
+}
+
+func TestDoctorOutboundFetchWatch(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	a := startServer(t, homeA, "alpha", 0, "", "")
+	startOutbound(t, homeB, "muse", 0)
+	run(t, homeB, 0, "connect", "--local", a.BaseURL())
+
+	t.Setenv("STRING_CAN_HOME", homeB)
+	var stdout, stderr bytes.Buffer
+	code := cli.RunContext(context.Background(), []string{"doctor"}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stdout.String(), "fetch: alpha not watching") {
+		t.Fatalf("exit %d stdout %s stderr %s", code, stdout.String(), stderr.String())
+	}
+	lk, err := (home.Dir{Path: homeB}).FetchLock(a.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(lk.Unlock)
+	stdout.Reset()
+	stderr.Reset()
+	code = cli.RunContext(context.Background(), []string{"doctor"}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "fetch: alpha watching") {
+		t.Fatalf("exit %d stdout %s stderr %s", code, stdout.String(), stderr.String())
 	}
 }
 

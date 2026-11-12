@@ -14,7 +14,7 @@ The notes travel over your private Tailscale network, so only your machines can 
 - **Split your token spend.** Send each task to whichever agent (and whichever service's plan) should pay for it, instead of running everything through one expensive context.
 - **No middleman.** Agents talk directly, peer to peer. Nobody hosts your messages but you.
 - **Identity is a key, not an account.** An agent's public key *is* its identity. Every message is signed and verified, and messages from non-contacts get rejected.
-- **Works when one side can't take inbound traffic.** An agent behind a wall can just poll with `fetch`. 
+- **Works when one side can't take inbound traffic.** An agent behind a wall runs `supervise --outbound-only` and polls with `fetch`. 
 - **Your agent sets it up for you.** Tell it "set up string-can from this repo." It follows [`AGENTS.md`](AGENTS.md) and replies with two lines you paste to the other agent. That's the whole onboarding.
 - **One small binary.** HTTP only, and data in one folder (`~/.string-can`).
 
@@ -69,7 +69,7 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 - **Contacts:** both sides add each other. Messages from anyone else are rejected.
 - **Transport:** plain HTTP between peers on your tailnet. `serve` binds the Tailscale IPv4 address (`100.64.0.0/10`) on port `8741` by default. It waits for Tailscale if it isn't up yet, prints a hint after ~30s if there is no `100.x` address (`--wait` makes that a timeout), and it rebinds if the tailnet address changes. `doctor` (and `serve`) also check `tailscale status --json` `Self.Online`, because the 100.x address can stay assigned while Tailscale is offline.
 - **Stable URLs:** `--host muse` advertises `http://muse:8741` (MagicDNS), so peer URLs survive IP changes. Skip `--host` on Grok Bot nodes — their MagicDNS name often changes after a reset.
-- **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections runs `serve --outbound-only` and polls with `fetch` / `fetch --watch`. Contacts learned that way are pull-only: the other side stores messages for fetch instead of retrying push.
+- **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections runs `supervise --outbound-only`, which keeps `serve` up (outbound retries and unconfirmed checks) and polls with `fetch --watch`. Contacts learned that way are pull-only: the other side stores messages for fetch instead of retrying push.
 - **Wake-ups (optional):** set `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` to get pinged when a message lands. The webhook only carries a nudge, never the message text. The agent reads the thread itself.
 - **Lost responses:** `STRING_CAN_PEER_TIMEOUT` (default `20s`) bounds one send. If that response never arrives, `send` says `unconfirmed` and checks the peer's thread before calling it a failure. `status` lists `pending` and `unconfirmed` separately.
 - **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`).
@@ -81,6 +81,7 @@ string-can pubkey                                   # print your public key
 string-can url                                      # print your listen URL
 string-can name <display-name>                      # set your display name
 string-can serve [--name <n>] [--port <p>] [--host <name>] [--local] [--outbound-only] [--wait <duration>]
+string-can supervise [--name <n>] [--port <p>] [--host <name>] [--local] [--outbound-only] [--wait <duration>] [--every <duration>] [public-key...]
 string-can invite                                   # print a connect line for the other side
 string-can connect <url> [--name <label>] [--local] [--pull-only]
 string-can rename <public-key> <label>              # relabel a contact
@@ -89,7 +90,7 @@ string-can send <public-key> <text>                 # send a signed message
 string-can thread <public-key> [--since <id>]       # read a conversation
 string-can fetch <public-key> [--watch] [--every <duration>]
 string-can status                                   # undelivered outbound (pending or unconfirmed)
-string-can doctor                                   # check identity, server, Tailscale bind, contacts, webhook
+string-can doctor                                   # check identity, server, Tailscale bind, contacts, webhook, fetch watchers
 ```
 
 ## Security notes
@@ -110,19 +111,25 @@ Sample units keep `serve` alive across restarts and bring it back when Tailscale
 
 Copy the file, set the binary path (and `STRING_CAN_HOME` if you need to), then enable it with `systemctl --user enable --now string-can` or `launchctl load`.
 
+Outbound-only agents should run `string-can supervise` instead, so `serve` and `fetch --watch` restart together. Use one of these, and leave the plain `serve` unit off:
+
+- systemd (user): [`contrib/string-can-supervise.service`](contrib/string-can-supervise.service)
+- launchd: [`contrib/com.supersuit.string-can-supervise.plist`](contrib/com.supersuit.string-can-supervise.plist)
+- cron, for a container with neither: [`contrib/supervise-watchdog.sh`](contrib/supervise-watchdog.sh)
+
 ## Agent platforms
 
 | Agent | Mode | Notes |
 | --- | --- | --- |
 | Grok Bot | Normal (accepts inbound) | runs its own `tailscaled`; see [Grok Bot setup](#grok-bot) |
-| Muse | Outbound-only | cannot accept inbound (can connect out); no tailnet interface; keep `fetch --watch <peer-key>` running at all times |
+| Muse | Outbound-only | cannot accept inbound (can connect out); no tailnet interface; run `supervise --outbound-only` so `serve` and `fetch --watch` both stay up |
 | OpenClaw | Normal (accepts inbound) | |
 
 **Normal** means the agent can accept inbound connections (others can push to it). **Outbound-only** means the agent cannot accept inbound connections. It can still connect out and send, but nobody can push to it; it receives by fetching.
 
 For two agents to talk, at least one of them must accept inbound connections. Two outbound-only agents cannot reach each other. When one side is outbound-only, the normal side saves it as a pull-only contact (`connect --pull-only <key>`), and messages wait for the outbound-only side to fetch.
 
-Any outbound-only agent must run `string-can fetch --watch <peer-key>` continuously, at all times, on its machine (in the background or as a service; restart it if it exits). That is the default receive path — do not wait for a manual poll.
+Any outbound-only agent runs `string-can supervise --outbound-only` continuously, at all times, on its machine (in the background, as a service, or under [`contrib/supervise-watchdog.sh`](contrib/supervise-watchdog.sh)). That process keeps `serve` and `fetch --watch` running and restarts either if it exits. `fetch --watch` is how it receives; `serve` is how outbound sends get retried.
 
 ## Grok Bot
 
@@ -138,14 +145,19 @@ Do not pin `--host` to the MagicDNS name. The node often comes back as `grokbot-
 
 Some agents (Muse in a container, anything with no `100.x` interface) can make outbound HTTP but never accept inbound connections.
 
-On that agent:
+`serve` is still required there: its wake loop retries outbound delivery and checks `unconfirmed` messages. If it dies and only `fetch --watch` is supervised, receiving looks fine while sending stalls, and nothing alerts you.
+
+On that agent, run one supervisor and leave it up:
 
 ```sh
-string-can serve --outbound-only --name muse
+string-can supervise --outbound-only --name muse
 string-can connect http://<peer's-tailnet-url>:8741
-string-can fetch --watch <peer's-public-key>
 ```
 
-`--outbound-only` binds `127.0.0.1` immediately (no wait for Tailscale), advertises `outbound_only` on `GET /` and in the connect handshake, and prints the public key. Do not give the loopback listen URL to a remote peer. Keep `fetch --watch <peer's-public-key>` running at all times (background or as a service; restart it if it exits) — outbound-only agents cannot accept inbound connections, so this is how they receive.
+`supervise` starts `serve --outbound-only` and restarts it if it exits. After `connect`, it starts `fetch --watch` for each contact that has a URL, and restarts that if it exits. Pass public keys (`string-can supervise --outbound-only <peer-key>`) to watch only those peers. `--every` sets the poll interval (default `5s`).
+
+`--outbound-only` binds `127.0.0.1` immediately (no wait for Tailscale), advertises `outbound_only` on `GET /` and in the connect handshake, and prints the public key on stdout. Do not give the loopback listen URL to a remote peer.
+
+Keep the `supervise` process running for the life of the agent. In a container with no systemd or launchd, start it in the background and cron [`contrib/supervise-watchdog.sh`](contrib/supervise-watchdog.sh) so the supervisor comes back if it is killed. With systemd or launchd, use the supervise units in [`contrib/`](contrib/).
 
 On the reachable side, that handshake (or `connect --pull-only <key>`) marks the contact pull-only. `send` stores the message for them to fetch instead of retrying push, `status` stays clean, and `doctor` reports `pull-only (expected)` rather than `unreachable`.

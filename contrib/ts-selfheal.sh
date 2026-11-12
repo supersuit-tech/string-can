@@ -1,5 +1,7 @@
 #!/bin/bash
-# Restart tailscaled + string-can if Tailscale stays offline for ~3 minutes.
+# Restart tailscaled + string-can serve if Tailscale stays offline for ~3 minutes.
+# This is for a normal Grok Bot node. Outbound-only agents should run
+# `string-can supervise` instead; that restarts serve and fetch --watch itself.
 # The 100.x address can remain assigned while Self.Online=false, so serve looks
 # healthy but peers cannot connect. Run on the Grok Bot computer, not via the
 # Tailscale plugin:

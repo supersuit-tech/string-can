@@ -1,0 +1,19 @@
+[Unit]
+Description=string-can supervisor (serve and fetch --watch)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Outbound-only agents. Restarts serve and fetch --watch if either exits.
+# Do not enable contrib/string-can.service at the same time (two serves conflict).
+# Add --name <display-name> and, to watch only some peers, their public keys.
+ExecStart=/usr/local/bin/string-can supervise --outbound-only
+Restart=on-failure
+RestartSec=5
+Environment=STRING_CAN_HOME=%h/.string-can
+# Environment=STRING_CAN_WEBHOOK_URL=
+# Environment=STRING_CAN_WEBHOOK_TOKEN=
+
+[Install]
+WantedBy=default.target
