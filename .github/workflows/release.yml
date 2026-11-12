@@ -1,0 +1,33 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Build
+        run: |
+          set -e
+          for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS=${pair%/*}
+            GOARCH=${pair#*/}
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags="-s -w" -o "string-can-${GOOS}-${GOARCH}" .
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            string-can-linux-amd64
+            string-can-linux-arm64
+            string-can-darwin-amd64
+            string-can-darwin-arm64

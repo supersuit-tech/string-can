@@ -171,3 +171,21 @@ func (l *Lock) Unlock() {
 	_ = l.f.Close()
 	l.f = nil
 }
+
+// Serving reports whether another process holds the serve lock.
+func (d Dir) Serving() (bool, error) {
+	path := d.file(lockFile)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return true, nil
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false, nil
+}

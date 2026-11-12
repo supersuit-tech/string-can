@@ -54,8 +54,8 @@ func TestTwoLocalServersSend(t *testing.T) {
 	a := startServer(t, homeA, "alpha", 0, "", "")
 	b := startServer(t, homeB, "beta", 0, "", "")
 
-	run(t, homeA, 0, "connect", b.PublicKey(), b.BaseURL())
-	run(t, homeB, 0, "connect", a.PublicKey(), a.BaseURL())
+	run(t, homeA, 0, "connect", "--local", b.PublicKey(), b.BaseURL())
+	run(t, homeB, 0, "connect", "--local", a.PublicKey(), a.BaseURL())
 	out := run(t, homeA, 0, "send", b.PublicKey(), "hi")
 	if !strings.HasPrefix(strings.TrimSpace(out), "sent ") || strings.Contains(out, "pending") {
 		t.Fatalf("send: %q", out)
@@ -183,7 +183,7 @@ func TestRenameLabelOnly(t *testing.T) {
 	homeB := t.TempDir()
 	a := startServer(t, homeA, "alpha", 0, "", "")
 	b := startServer(t, homeB, "beta", 0, "", "")
-	run(t, homeA, 0, "connect", b.PublicKey(), b.BaseURL())
+	run(t, homeA, 0, "connect", "--local", b.PublicKey(), b.BaseURL())
 	out := run(t, homeA, 0, "rename", b.PublicKey(), "buddy")
 	var c struct {
 		Label     string `json:"label"`
@@ -245,8 +245,8 @@ func TestWebhookNudge(t *testing.T) {
 	homeB := t.TempDir()
 	a := startServer(t, homeA, "alpha", 0, "", "")
 	b := startServer(t, homeB, "beta", 0, hook.URL, "secret-token")
-	run(t, homeA, 0, "connect", b.PublicKey(), b.BaseURL())
-	run(t, homeB, 0, "connect", a.PublicKey(), a.BaseURL())
+	run(t, homeA, 0, "connect", "--local", b.PublicKey(), b.BaseURL())
+	run(t, homeB, 0, "connect", "--local", a.PublicKey(), a.BaseURL())
 	run(t, homeA, 0, "send", b.PublicKey(), "SECRET_PAYLOAD")
 
 	b.Tick(context.Background())
@@ -291,8 +291,8 @@ func TestOutboundRetry(t *testing.T) {
 	b := startServer(t, homeB, "beta", 0, "", "")
 	bURL := b.BaseURL()
 	bPort := mustPort(t, bURL)
-	run(t, homeA, 0, "connect", b.PublicKey(), bURL)
-	run(t, homeB, 0, "connect", a.PublicKey(), a.BaseURL())
+	run(t, homeA, 0, "connect", "--local", b.PublicKey(), bURL)
+	run(t, homeB, 0, "connect", "--local", a.PublicKey(), a.BaseURL())
 	b.Stop()
 
 	out := run(t, homeA, 0, "send", b.PublicKey(), "later")
@@ -342,6 +342,7 @@ func startServer(t *testing.T, dir, name string, port int, webhook, token string
 		Home:         dir,
 		Name:         name,
 		Port:         port,
+		Local:        true,
 		WakeEvery:    time.Hour,
 		WebhookURL:   webhook,
 		WebhookToken: token,
