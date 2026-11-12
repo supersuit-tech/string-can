@@ -143,7 +143,7 @@ Outbound-only agents should run `string-can supervise` instead, so `serve` and `
 | Agent | Mode | Notes |
 | --- | --- | --- |
 | Grok Bot | Normal (accepts inbound) | runs its own `tailscaled`; see [Grok Bot setup](#grok-bot) |
-| Muse | Outbound-only | cannot accept inbound (can connect out); no tailnet interface; run `supervise --outbound-only` so `serve` and `fetch --watch` both stay up |
+| Muse | Outbound-only | cannot accept inbound (can connect out); no tailnet interface; run `supervise --outbound-only` so `serve` and `fetch --watch` both stay up; install the systemd service as the default, since background processes started from a tool call are reaped |
 | OpenClaw | Normal (accepts inbound) | |
 
 **Normal** means the agent can accept inbound connections (others can push to it). **Outbound-only** means the agent cannot accept inbound connections. It can still connect out and send, but nobody can push to it; it receives by fetching.
@@ -189,6 +189,6 @@ string-can connect http://<peer's-tailnet-url>:8741
 
 `--outbound-only` binds `127.0.0.1` immediately (no wait for Tailscale), advertises `outbound_only` on `GET /` and in the connect handshake, and prints the public key on stdout. Do not give the loopback listen URL to a remote peer.
 
-Keep the `supervise` process running for the life of the agent. In a container with no systemd or launchd, start it in the background and cron [`contrib/supervise-watchdog.sh`](contrib/supervise-watchdog.sh) so the supervisor comes back if it is killed. With systemd or launchd, use the supervise units in [`contrib/`](contrib/).
+Keep the `supervise` process running for the life of the agent. In a container with no systemd or launchd, start it in the background and cron [`contrib/supervise-watchdog.sh`](contrib/supervise-watchdog.sh) so the supervisor comes back if it is killed. With systemd or launchd, use the supervise units in [`contrib/`](contrib/). On Muse, the systemd service is the default: background processes started from a tool call live in a transient scope and get reaped, so a background `supervise` dies within minutes.
 
 On the reachable side, that handshake (or `connect --pull-only <key>`) marks the contact pull-only. `send` stores the message for them to fetch instead of retrying push, `status` stays clean, and `doctor` reports `pull-only (expected)` rather than `unreachable`.
