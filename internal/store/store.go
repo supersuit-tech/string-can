@@ -21,6 +21,7 @@ type Contact struct {
 	Label      string
 	BaseURL    string
 	StatedName string
+	PullOnly   bool
 	CreatedAt  int64
 }
 
@@ -65,7 +66,8 @@ CREATE TABLE IF NOT EXISTS contacts (
 	label TEXT NOT NULL,
 	base_url TEXT NOT NULL,
 	stated_name TEXT NOT NULL,
-	created_at INTEGER NOT NULL
+	created_at INTEGER NOT NULL,
+	pull_only INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +87,10 @@ CREATE TABLE IF NOT EXISTS messages (
 		return nil, err
 	}
 	if err := migrateMessages(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := migrateContacts(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -120,6 +126,35 @@ func migrateMessages(db *sql.DB) error {
 	return nil
 }
 
+func migrateContacts(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(contacts)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	hasPullOnly := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "pull_only" {
+			hasPullOnly = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasPullOnly {
+		_, err = db.Exec(`ALTER TABLE contacts ADD COLUMN pull_only INTEGER NOT NULL DEFAULT 0`)
+		return err
+	}
+	return nil
+}
+
 // Close closes the database.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -135,27 +170,40 @@ func (s *Store) UpsertContact(c Contact) error {
 	if c.CreatedAt == 0 {
 		c.CreatedAt = time.Now().UnixMilli()
 	}
+	pullOnly := 0
+	if c.PullOnly {
+		pullOnly = 1
+	}
 	_, err := s.db.Exec(`
-INSERT INTO contacts (public_key, label, base_url, stated_name, created_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO contacts (public_key, label, base_url, stated_name, created_at, pull_only)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(public_key) DO UPDATE SET
 	label = excluded.label,
 	base_url = excluded.base_url,
-	stated_name = excluded.stated_name
-`, c.PublicKey, c.Label, c.BaseURL, c.StatedName, c.CreatedAt)
+	stated_name = excluded.stated_name,
+	pull_only = excluded.pull_only
+`, c.PublicKey, c.Label, c.BaseURL, c.StatedName, c.CreatedAt, pullOnly)
+	if err != nil {
+		return err
+	}
+	if c.PullOnly {
+		_, err = s.db.Exec(`UPDATE messages SET delivered = 1, last_error = '' WHERE peer_pubkey = ? AND delivered = 0`, c.PublicKey)
+	}
 	return err
 }
 
 // GetContact loads a contact by public key.
 func (s *Store) GetContact(pub string) (Contact, error) {
 	var c Contact
+	var pullOnly int
 	err := s.db.QueryRow(`
-SELECT public_key, label, base_url, stated_name, created_at
+SELECT public_key, label, base_url, stated_name, created_at, pull_only
 FROM contacts WHERE public_key = ?
-`, pub).Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt)
+`, pub).Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Contact{}, fmt.Errorf("not a contact")
 	}
+	c.PullOnly = pullOnly != 0
 	return c, err
 }
 
@@ -169,7 +217,7 @@ func (s *Store) IsContact(pub string) (bool, error) {
 // ListContacts returns contacts oldest first.
 func (s *Store) ListContacts() ([]Contact, error) {
 	rows, err := s.db.Query(`
-SELECT public_key, label, base_url, stated_name, created_at
+SELECT public_key, label, base_url, stated_name, created_at, pull_only
 FROM contacts ORDER BY created_at ASC, public_key ASC
 `)
 	if err != nil {
@@ -179,9 +227,11 @@ FROM contacts ORDER BY created_at ASC, public_key ASC
 	var out []Contact
 	for rows.Next() {
 		var c Contact
-		if err := rows.Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt); err != nil {
+		var pullOnly int
+		if err := rows.Scan(&c.PublicKey, &c.Label, &c.BaseURL, &c.StatedName, &c.CreatedAt, &pullOnly); err != nil {
 			return nil, err
 		}
+		c.PullOnly = pullOnly != 0
 		out = append(out, c)
 	}
 	return out, rows.Err()

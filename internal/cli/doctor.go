@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/supersuit-tech/string-can/internal/canon"
@@ -16,7 +18,12 @@ import (
 )
 
 func (e env) cmdFetch(ctx context.Context, args []string) int {
-	_, pos, help, err := flags("fetch", args, nil)
+	var watch bool
+	every := 5 * time.Second
+	fs := newFlagSet("fetch")
+	fs.BoolVar(&watch, "watch", false, "poll until interrupted")
+	fs.DurationVar(&every, "every", 5*time.Second, "watch poll interval")
+	pos, help, err := parseWith(fs, args, map[string]bool{"every": true})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("fetch"))
 		return 0
@@ -25,11 +32,14 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 		return e.fail(err)
 	}
 	if len(pos) != 1 {
-		return e.fail(fmt.Errorf("usage: string-can fetch <public-key>"))
+		return e.fail(fmt.Errorf("usage: string-can fetch <public-key> [--watch] [--every <duration>]"))
 	}
 	key, err := canon.NormalizeKey(pos[0])
 	if err != nil {
 		return e.fail(err)
+	}
+	if every <= 0 {
+		every = 5 * time.Second
 	}
 	st, dir, err := openStore()
 	if err != nil {
@@ -40,14 +50,49 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	if c.BaseURL == "" {
+		return e.fail(fmt.Errorf("contact has no URL to fetch from"))
+	}
 	priv, err := dir.Identity()
 	if err != nil {
 		return e.fail(err)
 	}
 	ourKey := canon.PublicHexFromPrivate(priv)
-	remote, err := push.Thread(ctx, push.DefaultClient(), c.BaseURL, ourKey)
+	if watch {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
+	for {
+		n, code := e.fetchOnce(ctx, st, c.BaseURL, ourKey, key)
+		if code != 0 && !watch {
+			return code
+		}
+		if !watch {
+			fmt.Fprintf(e.stdout, "fetched %d\n", n)
+			return 0
+		}
+		if n > 0 {
+			fmt.Fprintf(e.stdout, "fetched %d\n", n)
+			if f, ok := e.stdout.(*os.File); ok {
+				_ = f.Sync()
+			}
+		}
+		timer := time.NewTimer(every)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0
+		case <-timer.C:
+		}
+	}
+}
+
+func (e env) fetchOnce(ctx context.Context, st *store.Store, baseURL, ourKey, key string) (int, int) {
+	remote, err := push.Thread(ctx, push.DefaultClient(), baseURL, ourKey)
 	if err != nil {
-		return e.fail(err)
+		fmt.Fprintf(e.stderr, "string-can: %v\n", err)
+		return 0, 1
 	}
 	n := 0
 	for _, rm := range remote {
@@ -85,11 +130,10 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 			Ts   int64  `json:"ts"`
 			Text string `json:"text"`
 		}{id, from, rm.Ts, rm.Text}); code != 0 {
-			return code
+			return n, code
 		}
 	}
-	fmt.Fprintf(e.stdout, "fetched %d\n", n)
-	return 0
+	return n, 0
 }
 
 func (e env) cmdStatus(args []string) int {
@@ -159,10 +203,14 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 	if lerr != nil || listen == "" {
 		fmt.Fprintln(e.stdout, "  listen: (none)")
 		ok = false
+		e.reportTailnet(ctx, "", dir.OutboundOnly(), &ok)
 	} else {
 		fmt.Fprintf(e.stdout, "  listen: %s\n", listen)
 		host := listenaddr.HostOf(listen)
+		outbound := dir.OutboundOnly()
 		switch {
+		case outbound:
+			fmt.Fprintln(e.stdout, "  bind: loopback (outbound-only; peers cannot push)")
 		case listenaddr.IsTailscaleIPv4(host):
 			fmt.Fprintln(e.stdout, "  bind: tailnet")
 		case listenaddr.IsLoopbackHost(host):
@@ -174,6 +222,7 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 			fmt.Fprintln(e.stdout, "  reachability: listen URL did not accept a connection")
 			ok = false
 		}
+		e.reportTailnet(ctx, host, outbound, &ok)
 	}
 
 	webhook := os.Getenv("STRING_CAN_WEBHOOK_URL")
@@ -206,9 +255,22 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 	client := push.DefaultClient()
 	for _, c := range contacts {
 		line := fmt.Sprintf("  %s (%s)", c.Label, canon.ShortKey(c.PublicKey))
-		if listen != "" && listenaddr.IsLoopbackURL(listen) && !listenaddr.IsLoopbackURL(c.BaseURL) {
+		if listen != "" && listenaddr.IsLoopbackURL(listen) && c.BaseURL != "" && !listenaddr.IsLoopbackURL(c.BaseURL) && !dir.OutboundOnly() && !c.PullOnly {
 			fmt.Fprintf(e.stdout, "%s: remote URL while this server is on loopback\n", line)
 			ok = false
+		}
+		if c.PullOnly {
+			if c.BaseURL == "" {
+				fmt.Fprintf(e.stdout, "%s: pull-only (expected)\n", line)
+				continue
+			}
+			_, err := push.GetInfo(ctx, client, c.BaseURL)
+			if err != nil {
+				fmt.Fprintf(e.stdout, "%s: pull-only (expected)\n", line)
+				continue
+			}
+			fmt.Fprintf(e.stdout, "%s: reachable, pull-only (will not push)\n", line)
+			continue
 		}
 		info, err := push.GetInfo(ctx, client, c.BaseURL)
 		if err != nil {
@@ -240,6 +302,37 @@ func (e env) cmdDoctor(ctx context.Context, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func (e env) reportTailnet(ctx context.Context, bindHost string, outbound bool, ok *bool) {
+	if outbound {
+		fmt.Fprintln(e.stdout, "tailnet: unused (outbound-only)")
+		return
+	}
+	if listenaddr.IsLoopbackHost(bindHost) {
+		fmt.Fprintln(e.stdout, "tailnet: unused (loopback bind)")
+		return
+	}
+	ip, hasIP := listenaddr.TailscaleIPv4()
+	online, checked := listenaddr.SelfOnline(ctx)
+	switch {
+	case checked && !online:
+		fmt.Fprintln(e.stdout, "tailnet: offline (Self.Online=false; peers cannot reach you)")
+		*ok = false
+	case checked && online:
+		if hasIP {
+			fmt.Fprintf(e.stdout, "tailnet: online (%s)\n", ip)
+		} else {
+			fmt.Fprintln(e.stdout, "tailnet: online")
+		}
+	case hasIP:
+		fmt.Fprintf(e.stdout, "tailnet: %s assigned; Self.Online unknown (tailscale status --json failed)\n", ip)
+	case bindHost == "":
+		fmt.Fprintln(e.stdout, "tailnet: no 100.x interface")
+		*ok = false
+	default:
+		fmt.Fprintln(e.stdout, "tailnet: Self.Online unknown (tailscale status --json failed)")
+	}
 }
 
 func dialOK(baseURL string) bool {

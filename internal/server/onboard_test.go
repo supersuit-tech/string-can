@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -259,6 +261,75 @@ func TestAdvertiseHost(t *testing.T) {
 	}
 }
 
+func TestServeWaitTimeout(t *testing.T) {
+	old := listenaddr.FindTailscaleIPv4
+	t.Cleanup(func() { listenaddr.FindTailscaleIPv4 = old })
+	listenaddr.FindTailscaleIPv4 = func() (string, bool) { return "", false }
+
+	h := t.TempDir()
+	t.Setenv("STRING_CAN_HOME", h)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	code := cli.RunContext(ctx, []string{"serve", "--name", "x", "--wait", "80ms"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit %d stdout %s stderr %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--outbound-only") && !strings.Contains(stderr.String(), "--local") {
+		t.Fatalf("stderr %q", stderr.String())
+	}
+}
+
+func TestServeOutboundOnly(t *testing.T) {
+	old := listenaddr.FindTailscaleIPv4
+	t.Cleanup(func() { listenaddr.FindTailscaleIPv4 = old })
+	listenaddr.FindTailscaleIPv4 = func() (string, bool) { return "", false }
+
+	h := t.TempDir()
+	t.Setenv("STRING_CAN_HOME", h)
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- cli.RunContext(ctx, []string{"serve", "--outbound-only", "--name", "muse"}, &stdout, &stderr)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	listen := ""
+	for time.Now().Before(deadline) {
+		out := stdout.String()
+		if strings.Contains(out, "string-can listen:") && strings.Contains(stderr.String(), "outbound-only") {
+			for _, line := range strings.Split(out, "\n") {
+				if rest, ok := strings.CutPrefix(line, "string-can listen: "); ok {
+					listen = rest
+				}
+			}
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if listen == "" {
+		cancel()
+		t.Fatalf("missing listen line: stdout %s stderr %s", stdout.String(), stderr.String())
+	}
+	info := getInfo(t, listen)
+	if !info.OutboundOnly {
+		cancel()
+		t.Fatalf("GET / should advertise outbound_only: %+v", info)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not exit")
+	}
+	if !strings.Contains(stdout.String(), "string-can public key:") {
+		t.Fatalf("stdout %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "fetch --watch") {
+		t.Fatalf("stderr %s", stderr.String())
+	}
+}
+
 func TestBindRequiresLocalWithoutTailscale(t *testing.T) {
 	old := listenaddr.FindTailscaleIPv4
 	t.Cleanup(func() { listenaddr.FindTailscaleIPv4 = old })
@@ -344,6 +415,200 @@ func TestWaitForTailscale(t *testing.T) {
 	if ip != "100.64.1.2" {
 		t.Fatalf("ip %s", ip)
 	}
+}
+
+func TestOutboundOnlyHandshakeAndSend(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	a := startServer(t, homeA, "alpha", 0, "", "")
+	b := startOutbound(t, homeB, "muse", 0)
+	run(t, homeB, 0, "connect", "--local", a.BaseURL())
+
+	out := run(t, homeA, 0, "contacts")
+	if !strings.Contains(out, `"pull_only":true`) {
+		t.Fatalf("A should mark muse pull-only: %s", out)
+	}
+	sent := run(t, homeA, 0, "send", b.PublicKey(), "for-muse")
+	if !strings.Contains(sent, "(pull)") || strings.Contains(sent, "pending") {
+		t.Fatalf("send: %q", sent)
+	}
+	status := run(t, homeA, 0, "status")
+	if strings.TrimSpace(status) != "" {
+		t.Fatalf("status should be empty, got %q", status)
+	}
+	fetched := run(t, homeB, 0, "fetch", a.PublicKey())
+	if !strings.Contains(fetched, `"text":"for-muse"`) || !strings.Contains(fetched, "fetched 1") {
+		t.Fatalf("fetch: %s", fetched)
+	}
+	doc := run(t, homeA, 0, "doctor")
+	if !strings.Contains(doc, "pull-only") {
+		t.Fatalf("doctor: %s", doc)
+	}
+}
+
+func TestConnectPullOnlyKeyOnly(t *testing.T) {
+	h := t.TempDir()
+	startServer(t, h, "alpha", 0, "", "")
+	key := strings.Repeat("ab", 32)
+	out := run(t, h, 0, "connect", "--pull-only", key)
+	var c struct {
+		PublicKey string `json:"public_key"`
+		PullOnly  bool   `json:"pull_only"`
+		BaseURL   string `json:"base_url"`
+	}
+	if err := json.Unmarshal([]byte(out), &c); err != nil {
+		t.Fatal(err)
+	}
+	if !c.PullOnly || c.PublicKey != key || c.BaseURL != "" {
+		t.Fatalf("connect json: %s", out)
+	}
+	doc := run(t, h, 0, "doctor")
+	if !strings.Contains(doc, "pull-only (expected)") {
+		t.Fatalf("doctor: %s", doc)
+	}
+}
+
+func TestInviteOutboundOnly(t *testing.T) {
+	h := t.TempDir()
+	srv := startOutbound(t, h, "muse", 0)
+	t.Setenv("STRING_CAN_HOME", h)
+	var stdout, stderr bytes.Buffer
+	code := cli.RunContext(context.Background(), []string{"invite"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit %d %s %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "string-can connect --pull-only "+srv.PublicKey()) {
+		t.Fatalf("invite stdout %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "outbound-only") {
+		t.Fatalf("invite stderr %q", stderr.String())
+	}
+}
+
+func TestHandshakeOutboundOnlyLoopbackFromRemote(t *testing.T) {
+	h := t.TempDir()
+	srv := startServer(t, h, "host", 0, "", "")
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := canon.PublicHexFromPrivate(priv)
+	body, err := push.EncodeHandshake(from, "muse", "http://127.0.0.1:8741", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, srv.BaseURL()+"/connect", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.RemoteAddr = "100.64.1.2:4242"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-String-Can-Signature", canon.Sign(priv, body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d %s", resp.StatusCode, b)
+	}
+	c, err := srv.Store().GetContact(from)
+	if err != nil || !c.PullOnly {
+		t.Fatalf("contact %+v %v", c, err)
+	}
+}
+
+func TestDoctorTailnetOffline(t *testing.T) {
+	oldFind := listenaddr.FindTailscaleIPv4
+	oldStatus := listenaddr.ReadTailscaleStatus
+	t.Cleanup(func() {
+		listenaddr.FindTailscaleIPv4 = oldFind
+		listenaddr.ReadTailscaleStatus = oldStatus
+	})
+	listenaddr.FindTailscaleIPv4 = func() (string, bool) { return "100.64.1.2", true }
+	listenaddr.ReadTailscaleStatus = func(context.Context) ([]byte, error) {
+		return []byte(`{"Self":{"Online":false}}`), nil
+	}
+
+	h := t.TempDir()
+	startServer(t, h, "alpha", 0, "", "")
+	if err := os.WriteFile(filepath.Join(h, "listen.url"), []byte("http://100.64.1.2:8741\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STRING_CAN_HOME", h)
+	var stdout, stderr bytes.Buffer
+	code := cli.RunContext(context.Background(), []string{"doctor"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit %d stdout %s stderr %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Self.Online=false") {
+		t.Fatalf("doctor: %s", stdout.String())
+	}
+}
+
+func TestFetchWatch(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	a := startServer(t, homeA, "alpha", 0, "", "")
+	b := startServer(t, homeB, "beta", 0, "", "")
+	run(t, homeA, 0, "connect", "--local", b.BaseURL())
+	run(t, homeB, 0, "connect", "--local", a.BaseURL())
+	a.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Setenv("STRING_CAN_HOME", homeA)
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- cli.RunContext(ctx, []string{"fetch", "--watch", "--every", "30ms", b.PublicKey()}, &stdout, &stderr)
+	}()
+	time.Sleep(60 * time.Millisecond)
+	out := run(t, homeB, 0, "send", a.PublicKey(), "watched")
+	if !strings.Contains(out, "pending") {
+		t.Fatalf("expected pending send while A is down, got %q", out)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(stdout.String(), `"text":"watched"`) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch --watch did not exit")
+	}
+	if !strings.Contains(stdout.String(), `"text":"watched"`) {
+		t.Fatalf("watch stdout %s stderr %s", stdout.String(), stderr.String())
+	}
+}
+
+func startOutbound(t *testing.T, dir, name string, port int) *testServer {
+	t.Helper()
+	srv, err := server.New(server.Config{
+		Home:         dir,
+		Name:         name,
+		Port:         port,
+		OutboundOnly: true,
+		WakeEvery:    time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Bind(); err != nil {
+		srv.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(ctx) }()
+	ts := &testServer{Server: srv, cancel: cancel, errCh: errCh}
+	t.Cleanup(ts.Stop)
+	waitURL(t, srv.BaseURL())
+	return ts
 }
 
 func TestStoreLastError(t *testing.T) {
