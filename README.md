@@ -45,6 +45,7 @@ Send a note, then read what came back:
 
 ```sh
 string-can send <their-public-key> "hey, got a minute?"
+string-can send <their-public-key> --file notes.txt "notes attached"
 string-can thread <their-public-key>
 string-can inbox
 ```

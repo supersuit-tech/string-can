@@ -457,6 +457,58 @@ ORDER BY id ASC
 	return out, rows.Err()
 }
 
+// FileFromSender returns the signed file metadata on a message this sender
+// stored in the thread identified by sender (an inbound push).
+func (s *Store) FileFromSender(sender, sha string) (canon.File, bool, error) {
+	return s.findFile(sender, sender, sha, true)
+}
+
+// FileInThread returns signed file metadata from any verified message in
+// the thread with peer.
+func (s *Store) FileInThread(peer, sha string) (canon.File, bool, error) {
+	return s.findFile(peer, "", sha, false)
+}
+
+func (s *Store) findFile(peer, from, sha string, fromMustMatch bool) (canon.File, bool, error) {
+	sha, err := canon.NormalizeSHA(sha)
+	if err != nil {
+		return canon.File{}, false, err
+	}
+	msgs, err := s.VerifiedThread(peer, 0)
+	if err != nil {
+		return canon.File{}, false, err
+	}
+	for _, m := range msgs {
+		if fromMustMatch && m.FromPub != from {
+			continue
+		}
+		files, err := canon.FilesIn(m.Body)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.SHA256 == sha {
+				return f, true, nil
+			}
+		}
+	}
+	return canon.File{}, false, nil
+}
+
+// MessageByID returns one verified message in peer's thread.
+func (s *Store) MessageByID(peer string, id int64) (Message, bool, error) {
+	msgs, err := s.VerifiedThread(peer, 0)
+	if err != nil {
+		return Message{}, false, err
+	}
+	for _, m := range msgs {
+		if m.ID == id {
+			return m, true, nil
+		}
+	}
+	return Message{}, false, nil
+}
+
 // VerifiedThread is ListThread with rows whose signatures do not verify omitted.
 func (s *Store) VerifiedThread(peer string, since int64) ([]Message, error) {
 	msgs, err := s.ListThread(peer, since)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/supersuit-tech/string-can/internal/canon"
+	"github.com/supersuit-tech/string-can/internal/files"
 	"github.com/supersuit-tech/string-can/internal/home"
 	"github.com/supersuit-tech/string-can/internal/listenaddr"
 	"github.com/supersuit-tech/string-can/internal/push"
@@ -42,10 +43,11 @@ Usage:
   string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]
   string-can wake show <public-key>
   string-can wake clear <public-key>
-  string-can send [--auto] [--text-file <path>] <public-key> [<text>]
+  string-can send [--auto] [--text-file <path>] [--file <path>]... <public-key> [<text>]
   string-can thread <public-key> [--since <id>]
   string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]
   string-can fetch <public-key> [--watch] [--every <duration>]
+  string-can download <public-key> <message-id> [--out <dir>]
   string-can status
   string-can doctor
 
@@ -54,6 +56,7 @@ Environment:
   STRING_CAN_WEBHOOK_URL     POST target when a message arrives here
   STRING_CAN_WEBHOOK_TOKEN   Bearer token for that inbound webhook
   STRING_CAN_PEER_TIMEOUT    deadline for one send or thread check (default 20s)
+  STRING_CAN_MAX_FILE_BYTES  per-file limit (default 26214400, 25 MB)
   STRING_CAN_WAKE_WAIT       how long to poll a peer after waking it (default 60s)
   STRING_CAN_WAKE_INTERVAL   minimum gap between wakes of one contact (default 2m)
   STRING_CAN_WAKE_POLL       pause between those health checks (default 1s)
@@ -71,7 +74,7 @@ type env struct {
 
 // sendUsageLine is the send command synopsis. Reply text belongs in a file
 // or on stdin so a shell does not expand $ before string-can sees it.
-const sendUsageLine = "string-can send [--auto] [--text-file <path>] <public-key> [<text>]"
+const sendUsageLine = "string-can send [--auto] [--text-file <path>] [--file <path>]... <public-key> [<text>]"
 
 var errSendTextMissing = fmt.Errorf("message missing: pass <text>, --text-file <path>, or pipe the message on stdin")
 
@@ -125,6 +128,8 @@ func (e env) run(ctx context.Context, args []string) int {
 		return e.cmdInbox(ctx, rest)
 	case "fetch":
 		return e.cmdFetch(ctx, rest)
+	case "download":
+		return e.cmdDownload(ctx, rest)
 	case "status":
 		return e.cmdStatus(rest)
 	case "doctor":
@@ -354,10 +359,12 @@ func (e env) cmdContacts(args []string) int {
 func (e env) cmdSend(ctx context.Context, args []string) int {
 	var auto bool
 	var textFile string
+	var paths stringList
 	fs := newFlagSet("send")
 	fs.BoolVar(&auto, "auto", false, "count this send as an auto-reply")
 	fs.StringVar(&textFile, "text-file", "", "read the message from this file")
-	pos, help, err := parseWith(fs, args, map[string]bool{"text-file": true})
+	fs.Var(&paths, "file", "attach a file; repeat for more than one")
+	pos, help, err := parseWith(fs, args, map[string]bool{"text-file": true, "file": true})
 	if help {
 		fmt.Fprint(e.stdout, commandHelp("send"))
 		return 0
@@ -374,7 +381,7 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 	if sawTextFile && textFile == "" {
 		return e.fail(fmt.Errorf("--text-file path is empty"))
 	}
-	keyText, text, err := e.sendText(pos, textFile)
+	keyText, text, err := e.sendText(pos, textFile, len(paths) > 0)
 	if err != nil {
 		return e.fail(err)
 	}
@@ -382,8 +389,15 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
-	if err := canon.CheckText(text); err != nil {
-		return e.fail(err)
+	if text != "" {
+		if err := canon.CheckText(text); err != nil {
+			return e.fail(err)
+		}
+	} else if len(paths) == 0 {
+		return e.fail(fmt.Errorf("text is empty"))
+	}
+	if len(paths) > canon.MaxFiles {
+		return e.fail(fmt.Errorf("too many files"))
 	}
 	dir, err := home.Resolve()
 	if err != nil {
@@ -404,13 +418,37 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 		return e.fail(err)
 	}
 	now := time.Now()
+	// The reply cap runs before any row or blob is stored, same as text-only --auto.
 	if auto {
 		if err := autoGuard(st, key, now); err != nil {
 			return e.fail(err)
 		}
 	}
+	var attached []canon.File
+	if len(paths) > 0 {
+		max, err := files.MaxBytes()
+		if err != nil {
+			return e.fail(err)
+		}
+		blobs, err := files.Open(dir.Path)
+		if err != nil {
+			return e.fail(err)
+		}
+		seen := map[string]bool{}
+		for _, path := range paths {
+			f, err := blobs.Ingest(path, max)
+			if err != nil {
+				return e.fail(err)
+			}
+			if seen[f.Name] {
+				return e.fail(fmt.Errorf("duplicate file name %s", f.Name))
+			}
+			seen[f.Name] = true
+			attached = append(attached, f)
+		}
+	}
 	ts := now.UnixMilli()
-	body, err := canon.Encode(from, ts, text)
+	body, err := canon.EncodeMessage(from, ts, text, attached)
 	if err != nil {
 		return e.fail(err)
 	}
@@ -442,12 +480,19 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 		fmt.Fprintf(e.stdout, "sent %d (pull)\n", id)
 		return 0
 	}
-	res := push.Deliver(ctx, push.PeerClient(), c.BaseURL, from, sig, body, push.DeliverOptions{})
+	opt := push.DeliverOptions{}
+	if len(attached) > 0 {
+		blobs, err := files.Open(dir.Path)
+		if err != nil {
+			return e.fail(err)
+		}
+		opt.OpenBlob = blobs.Open
+	}
+	res := push.Deliver(ctx, push.PeerClient(), c.BaseURL, from, sig, body, opt)
 	if res.Kind != push.KindDelivered && c.WakeURL != "" && wake.SendNeedsWake(res.Kind, res.Err) {
 		if wake.Try(ctx, st, key, c.BaseURL, from, e.logf()) {
-			res = push.Deliver(ctx, push.PeerClient(), c.BaseURL, from, sig, body, push.DeliverOptions{
-				VerifyFirst: res.Kind == push.KindUnconfirmed,
-			})
+			opt.VerifyFirst = res.Kind == push.KindUnconfirmed
+			res = push.Deliver(ctx, push.PeerClient(), c.BaseURL, from, sig, body, opt)
 		}
 	}
 	switch res.Kind {
@@ -456,6 +501,9 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 			return e.fail(err)
 		}
 		fmt.Fprintf(e.stdout, "sent %d\n", id)
+		if res.FilesSkipped && res.Detail != "" {
+			fmt.Fprintf(e.stderr, "string-can: %s\n", res.Detail)
+		}
 	case push.KindUnconfirmed:
 		detail := res.Detail
 		if detail == "" {
@@ -482,7 +530,8 @@ func (e env) cmdSend(ctx context.Context, args []string) int {
 
 // sendText takes the message from exactly one of <text>, --text-file, or stdin.
 // File and stdin bytes are the message as-is, including a trailing newline.
-func (e env) sendText(pos []string, textFile string) (key, text string, err error) {
+// With --file and no text on a terminal, the text is empty.
+func (e env) sendText(pos []string, textFile string, hasFiles bool) (key, text string, err error) {
 	if textFile != "" {
 		if len(pos) > 1 {
 			return "", "", fmt.Errorf("pass the message as <text> or --text-file, not both")
@@ -500,6 +549,16 @@ func (e env) sendText(pos []string, textFile string) (key, text string, err erro
 	case 2:
 		return pos[0], pos[1], nil
 	case 1:
+		if hasFiles {
+			text, used, err := e.readOptionalStdin()
+			if err != nil {
+				return "", "", err
+			}
+			if !used {
+				return pos[0], "", nil
+			}
+			return pos[0], text, nil
+		}
 		text, err = e.readSendStdin()
 		if err != nil {
 			return "", "", err
@@ -508,6 +567,17 @@ func (e env) sendText(pos []string, textFile string) (key, text string, err erro
 	default:
 		return "", "", fmt.Errorf("usage: %s", sendUsageLine)
 	}
+}
+
+func (e env) readOptionalStdin() (text string, used bool, err error) {
+	if e.stdin == nil {
+		return "", false, nil
+	}
+	if f, ok := e.stdin.(*os.File); ok && isTerminal(f.Fd()) {
+		return "", false, nil
+	}
+	text, err = readCapped(e.stdin)
+	return text, true, err
 }
 
 func readTextFile(path string) (string, error) {
@@ -571,13 +641,12 @@ func (e env) cmdThread(args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
+	dir, err := home.Resolve()
+	if err != nil {
+		return e.fail(err)
+	}
 	for _, m := range msgs {
-		if code := e.writeJSON(struct {
-			ID   int64  `json:"id"`
-			From string `json:"from"`
-			Ts   int64  `json:"ts"`
-			Text string `json:"text"`
-		}{m.ID, m.FromPub, m.Ts, m.Text}); code != 0 {
+		if code := e.writeJSON(e.threadLine(dir, m)); code != 0 {
 			return code
 		}
 	}
@@ -744,13 +813,15 @@ func commandHelp(name string) string {
 	case "wake":
 		return "usage: string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME> | --token <literal>] [--proxy <url|direct|env>]\n       string-can wake show <public-key>\n       string-can wake clear <public-key>\n"
 	case "send":
-		return "usage: " + sendUsageLine + "\n       Omit <text> and --text-file to read the message from stdin.\n"
+		return "usage: " + sendUsageLine + "\n       Omit <text> and --text-file to read the message from stdin.\n       With --file and no text, the message text is empty.\n"
 	case "thread":
 		return "usage: string-can thread <public-key> [--since <id>]\n"
 	case "inbox":
 		return "usage: string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]\n"
 	case "fetch":
 		return "usage: string-can fetch <public-key> [--watch] [--every <duration>]\n"
+	case "download":
+		return "usage: string-can download <public-key> <message-id> [--out <dir>]\n"
 	case "status":
 		return "usage: string-can status\n"
 	case "doctor":

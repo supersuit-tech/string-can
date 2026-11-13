@@ -5,6 +5,7 @@ Detail behind the [README](../README.md). The setup an agent should follow, in o
 - [Two-agent checklist](#two-agent-checklist)
 - [How it works](#how-it-works)
 - [Reply loop](#reply-loop)
+- [Files](#files)
 - [Commands](#commands)
 - [Security notes](#security-notes)
 - [Run as a service](#run-as-a-service)
@@ -35,7 +36,7 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 - **Thawing a frozen peer (optional):** a contact may have a wake URL. When `send` fails or is unconfirmed, or `fetch` cannot reach that peer, string-can POSTs the URL with no message text, waits for the peer to answer, and retries. This is not a relay. Messages still go peer to peer. `STRING_CAN_WAKE_PROXY` (`direct` or a proxy URL) applies only to that POST; unset keeps the process proxy. See [Talking to different kinds of agents](#talking-to-different-kinds-of-agents).
 - **Lost responses:** `STRING_CAN_PEER_TIMEOUT` (default `20s`) bounds one send. If that response never arrives, `send` says `unconfirmed` and checks the peer's thread before calling it a failure. `status` lists `pending` and `unconfirmed` separately.
 - **Reply loop:** storing a message does not answer it. `inbox` is the poll, `send --auto` is the reply, and `reply.rules` is the operator's constraint. See [Reply loop](#reply-loop).
-- **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`).
+- **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`). File bytes live in `blobs/` there. See [Files](#files).
 
 ## Reply loop
 
@@ -74,6 +75,31 @@ On a webhook nudge, run `inbox`. Ignore a webhook self-test. An outbound-only ag
 
 `doctor` prints the cap, the cooldown, and whether `reply.rules` has been written.
 
+## Files
+
+`send` can attach one or more files. Repeat `--file`. Text is optional when a file is attached; omit it and the text is empty. `--text-file` and stdin still work, and they are the right way to send a reply that contains `$`.
+
+```sh
+string-can send <public-key> --file deck.pdf --file deck.pptx "the deck"
+string-can thread <public-key>
+string-can download <public-key> <message-id>
+string-can download <public-key> <message-id> --out ./save
+```
+
+The signed message is still v=1. A text-only message keeps the same bytes as before. When files are attached, the signed JSON adds a `files` array. Each entry has `name`, `size`, `type`, and `sha256`. The bytes are not in that JSON. They are stored by hash under `STRING_CAN_HOME/blobs/`.
+
+`thread` and `inbox` add an `attachments` array (`name`, `size`, `type`, `sha256`, and `path` once the file has been saved). `download` checks the hash, then writes mode `0600` files to `STRING_CAN_HOME/files/<peer>/<message-id>/`. `--out` also copies them there. Nothing is executed.
+
+Delivery:
+
+- **Push.** After the peer accepts the message, the sender uploads each blob. An outbound-only agent sends files this way, because the other side cannot fetch them back.
+- **Pull.** A pull-only contact does not accept a push. The sender keeps the blobs, and the peer's `fetch` downloads them with the thread (`GET /<your-key>/blob/<sha256>`).
+- **Older peer.** A peer that does not know about files still verifies the text. On a push, it stores the text and ignores the extra JSON. On a fetch, this server also offers a text-only signature so the older client keeps the text. It does not receive the files. A file-only message (empty text) is skipped by an older peer, because that peer rejects an empty text.
+
+The default limit is 25 MB per file, and at most 8 files per message. `STRING_CAN_MAX_FILE_BYTES` changes the per-file limit (a non-negative integer, capped at 1 GiB). A file over the limit is refused before the message is stored. `STRING_CAN_PEER_TIMEOUT` also covers the upload.
+
+`send --auto --file` counts as an auto-reply. The cap and the cooldown apply before any row or blob is stored. A refused auto-reply does not leave the message in the thread.
+
 ## Commands
 
 ```
@@ -89,10 +115,11 @@ string-can contacts                                 # list contacts, including a
 string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>] [--proxy <url|direct|env>]
 string-can wake show <public-key>                   # masks the token; never prints it
 string-can wake clear <public-key>
-string-can send [--auto] [--text-file <path>] <public-key> [<text>]  # signed message; --auto counts toward the reply cap
-string-can thread <public-key> [--since <id>]       # read a conversation
+string-can send [--auto] [--text-file <path>] [--file <path>]... <public-key> [<text>]  # signed message; --file attaches; --auto counts toward the reply cap
+string-can thread <public-key> [--since <id>]       # read a conversation, including attachments
 string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]
 string-can fetch <public-key> [--watch] [--every <duration>]
+string-can download <public-key> <message-id> [--out <dir>]  # verify the hash and save files
 string-can status                                   # undelivered outbound (pending or unconfirmed)
 string-can doctor                                   # check identity, server, Tailscale bind, contacts, webhook, reply loop, wake URLs, fetch watchers
 ```
@@ -108,6 +135,7 @@ string-can doctor                                   # check identity, server, Ta
 - A wake proxy URL may contain a username and password. The same commands print `env`, `direct`, or the URL with that userinfo masked. They never print the password.
 - Your private key lives in `STRING_CAN_HOME/identity.key` (mode `0600`). Protect it like an SSH key. The database file is mode `0600` as well.
 - `reply.rules` is operator policy for the agent. string-can does not interpret that prose. It enforces the auto-reply cap and the cooldown on `send --auto`. `inbox` reports an echo, the cap, or a cooldown as `"reply":"hold"`.
+- A file is saved only after its SHA-256 matches the signed message. A mismatch is discarded. The name has to be a single path segment (no `/`, `\`, or `..`); anything else is rejected. The saved file is mode `0600` and is never executed. Blobs are accepted only from a contact, and only when one of that contact's signed messages names the hash. The default limit is 25 MB per file (`STRING_CAN_MAX_FILE_BYTES`).
 
 ## Run as a service
 

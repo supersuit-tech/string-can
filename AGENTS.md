@@ -28,6 +28,9 @@ The reply loop, wake URLs, Tailscale notes, security notes, service units, and t
 3. Read the `string-can listen:` line. For an agent that accepts inbound connections, it must be a Tailscale address (`100.` in the host) or a MagicDNS name. Never reply with, hand out, or save `127.0.0.1` / `localhost` as a peer URL. If you see loopback and this agent should accept inbound connections, Tailscale is not up — wait and rerun `serve`, or pass `--local` only for two agents on one host. If this agent is outbound-only, loopback is expected: reply with the public key and that you are outbound-only, and do not hand out the listen URL. `string-can invite` then prints `connect --pull-only <your-public-key>` for the other side. Stop there until the user replies.
 4. When the user supplies another agent's listen URL, run `string-can connect <url>` (add `--local` only for a same-machine peer). Confirm with the JSON it prints. `string-can invite` prints a ready-to-run connect command for the other side. An outbound-only peer is recorded as pull-only so we do not retry push. If that peer sleeps when idle, configure its wake URL before you send (see the checklist above). `connect` accepts `--wake-url` with `--wake-token-file` or `--wake-token-env`.
 5. Leave the mailbox running. On an outbound-only agent the receive path is the `fetch --watch` inside `supervise`: leave `supervise` running. `fetch <public-key>` is a one-shot pull. `thread <public-key> [--since <id>]` is the conversation. Send with `send`. A lost response is `unconfirmed` (the peer may already have the message); `status` shows that separately from a real `pending` failure. Use `doctor` to check identity, the server, Tailscale bind (`Self.Online`), contacts, the webhook, the reply loop, and, on an outbound-only agent, that `fetch --watch` is up (`fetch: <label> not watching` means `supervise` is down or has not seen the contact yet).
+
+   To attach files: `string-can send <public-key> --file <path> [--file <path>] [<text>]`. Repeat `--file` for more than one. The signed message carries each file's name, size, content type, and SHA-256. Push uploads the bytes with the message (this is how an outbound-only agent sends a file). A pull-only contact leaves them on the sender, and `fetch` pulls them with the thread. `thread` and `inbox` list an `attachments` array. `string-can download <public-key> <message-id> [--out <dir>]` checks the hash and saves the files (default `~/.string-can/files/<peer>/<id>/`). The default limit is 25 MB per file (`STRING_CAN_MAX_FILE_BYTES`). Names are a single path segment, nothing is executed, and files are accepted only from contacts. `send --auto --file` uses the same cap and cooldown as any other auto-reply. An older peer still shows the text and ignores the files.
+
 6. Reply to new inbound messages. Storing them does not answer them. Poll `inbox`, read `reply.rules`, and `send --auto` unless the rules or a hold say not to. The default is to reply.
 
    The watermark is the last inbound local id already handed to you, stored per peer. `string-can inbox` prints only new inbound messages (never your own sends), one JSON object per line, then advances the watermark. `inbox --peek` does not advance it. `inbox --watch` streams arrivals from the local store. `string-can send --auto <public-key> --text-file <path>` is the reply.
@@ -48,7 +51,7 @@ The reply loop, wake URLs, Tailscale notes, security notes, service units, and t
 
 7. Treat a webhook body as a nudge. Run `inbox` and use the stored signature. Do not put message text on a webhook. Ignore a webhook self-test (`"string-can webhook self-test"`).
 
-`STRING_CAN_HOME` overrides the data directory (default `~/.string-can`). `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` configure inbound wake-ups on this agent (a nudge when a message arrives here, never the message text). `STRING_CAN_PEER_TIMEOUT` is the deadline for one send or thread check (default `20s`). `STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll a peer after posting its wake URL. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact. `STRING_CAN_WAKE_PROXY` (unset, `direct`, or a proxy URL) is the proxy for that POST only. Unset keeps the process proxy. `STRING_CAN_AUTO_CAP` (default `6`, `0` disables) is how many consecutive `send --auto` calls to one peer are allowed before the loop holds. `STRING_CAN_AUTO_COOLDOWN` (default `0s`, off) is the minimum gap between those calls.
+`STRING_CAN_HOME` overrides the data directory (default `~/.string-can`). `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` configure inbound wake-ups on this agent (a nudge when a message arrives here, never the message text). `STRING_CAN_PEER_TIMEOUT` is the deadline for one send or thread check (default `20s`). `STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll a peer after posting its wake URL. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact. `STRING_CAN_WAKE_PROXY` (unset, `direct`, or a proxy URL) is the proxy for that POST only. Unset keeps the process proxy. `STRING_CAN_AUTO_CAP` (default `6`, `0` disables) is how many consecutive `send --auto` calls to one peer are allowed before the loop holds. `STRING_CAN_AUTO_COOLDOWN` (default `0s`, off) is the minimum gap between those calls. `STRING_CAN_MAX_FILE_BYTES` (default 26214400, 25 MB) is the per-file limit.
 
 Commands:
 
@@ -65,10 +68,11 @@ string-can contacts
 string-can wake set <public-key> <url> [--token-file <path> | --token-env <NAME>] [--proxy <url|direct|env>]
 string-can wake show <public-key>
 string-can wake clear <public-key>
-string-can send [--auto] [--text-file <path>] <public-key> [<text>]
+string-can send [--auto] [--text-file <path>] [--file <path>]... <public-key> [<text>]
 string-can thread <public-key> [--since <id>]
 string-can inbox [--peek] [--watch] [--every <duration>] [public-key...]
 string-can fetch <public-key> [--watch] [--every <duration>]
+string-can download <public-key> <message-id> [--out <dir>]
 string-can status
 string-can doctor
 ```

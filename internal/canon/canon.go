@@ -15,29 +15,59 @@ const (
 	// MaxTextBytes is the maximum accepted message text size.
 	MaxTextBytes = 65536
 	// MaxBodyBytes caps an HTTP POST body, covering worst-case JSON escaping
-	// of a MaxTextBytes payload plus the canonical envelope.
-	MaxBodyBytes = MaxTextBytes*6 + 1024
-	keyLen       = 64
+	// of a MaxTextBytes payload plus file metadata and the canonical envelope.
+	// File bytes are not part of this body.
+	MaxBodyBytes = MaxTextBytes*6 + 64*1024
+	// MaxFiles is the maximum number of files on one message.
+	MaxFiles = 8
+	// ProtocolMaxFileBytes is the largest size a signed file entry may claim.
+	// STRING_CAN_MAX_FILE_BYTES may set a lower limit.
+	ProtocolMaxFileBytes int64 = 1 << 30
+	keyLen                     = 64
+	shaLen                     = 64
 )
 
-// Message is the signed canonical payload.
-type Message struct {
-	V    int    `json:"v"`
-	From string `json:"from"`
-	Ts   int64  `json:"ts"`
-	Text string `json:"text"`
+// File is signed metadata for one attachment. The bytes live outside the
+// message, addressed by SHA256.
+type File struct {
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	Type   string `json:"type"`
+	SHA256 string `json:"sha256"`
 }
 
-// Encode returns the canonical compact JSON bytes for a v=1 message.
+// Message is the signed canonical payload.
+// Files is omitted when empty, so a text-only message keeps the v=1 bytes
+// older peers already verify.
+type Message struct {
+	V     int    `json:"v"`
+	From  string `json:"from"`
+	Ts    int64  `json:"ts"`
+	Text  string `json:"text"`
+	Files []File `json:"files,omitempty"`
+}
+
+// Encode returns the canonical compact JSON bytes for a text-only v=1 message.
 func Encode(from string, ts int64, text string) ([]byte, error) {
+	return EncodeMessage(from, ts, text, nil)
+}
+
+// EncodeMessage returns the canonical compact JSON bytes for a v=1 message.
+// files is omitted from the JSON when empty. text may be empty only when
+// files is not.
+func EncodeMessage(from string, ts int64, text string, files []File) ([]byte, error) {
 	from, err := NormalizeKey(from)
 	if err != nil {
 		return nil, err
 	}
-	if err := CheckText(text); err != nil {
+	files, err = normalizeFiles(files)
+	if err != nil {
 		return nil, err
 	}
-	payload := Message{V: 1, From: from, Ts: ts, Text: text}
+	if err := checkPayload(text, files); err != nil {
+		return nil, err
+	}
+	payload := Message{V: 1, From: from, Ts: ts, Text: text, Files: files}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -98,10 +128,28 @@ func ParseAndCheck(body []byte, pathKey string) (Message, error) {
 	if m.Ts <= 0 {
 		return Message{}, fmt.Errorf("invalid timestamp")
 	}
-	if err := CheckText(m.Text); err != nil {
+	files, err := normalizeFiles(m.Files)
+	if err != nil {
+		return Message{}, err
+	}
+	m.Files = files
+	if err := checkPayload(m.Text, m.Files); err != nil {
 		return Message{}, err
 	}
 	return m, nil
+}
+
+// FilesIn returns the signed file list from a canonical body.
+// A text-only body returns nil, nil.
+func FilesIn(body string) ([]File, error) {
+	var m Message
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		return nil, fmt.Errorf("malformed body")
+	}
+	if len(m.Files) == 0 {
+		return nil, nil
+	}
+	return normalizeFiles(m.Files)
 }
 
 // CheckText reports whether text is non-empty valid UTF-8 within the size cap.
@@ -109,6 +157,20 @@ func CheckText(text string) error {
 	if text == "" {
 		return fmt.Errorf("text is empty")
 	}
+	return checkText(text)
+}
+
+func checkPayload(text string, files []File) error {
+	if text == "" {
+		if len(files) == 0 {
+			return fmt.Errorf("text is empty")
+		}
+		return nil
+	}
+	return checkText(text)
+}
+
+func checkText(text string) error {
 	if len(text) > MaxTextBytes {
 		return fmt.Errorf("text is too large")
 	}

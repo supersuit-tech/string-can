@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/supersuit-tech/string-can/internal/canon"
+	"github.com/supersuit-tech/string-can/internal/files"
 	"github.com/supersuit-tech/string-can/internal/home"
 	"github.com/supersuit-tech/string-can/internal/listenaddr"
 	"github.com/supersuit-tech/string-can/internal/push"
@@ -77,7 +78,7 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 	for {
 		// supervise runs this loop as `fetch --watch`. A miss here is how
 		// an outbound-only agent notices a frozen peer and wakes it.
-		n, code := e.fetchOnce(ctx, st, c, ourKey)
+		n, code := e.fetchOnce(ctx, st, dir, c, ourKey)
 		if code != 0 && !watch {
 			return code
 		}
@@ -101,7 +102,7 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 	}
 }
 
-func (e env) fetchOnce(ctx context.Context, st *store.Store, c store.Contact, ourKey string) (int, int) {
+func (e env) fetchOnce(ctx context.Context, st *store.Store, dir home.Dir, c store.Contact, ourKey string) (int, int) {
 	key := c.PublicKey
 	remote, err := push.Thread(ctx, push.PeerClient(), c.BaseURL, ourKey)
 	if err != nil && !c.PullOnly && c.WakeURL != "" && wake.FetchNeedsWake(err) {
@@ -114,7 +115,14 @@ func (e env) fetchOnce(ctx context.Context, st *store.Store, c store.Contact, ou
 		return 0, 1
 	}
 	n := 0
+	blobs, blobErr := files.Open(dir.Path)
 	for _, rm := range remote {
+		// An older peer cannot verify a body that includes files. The sender
+		// also publishes a text-only signature marked compat. Skip that copy
+		// here; the real entry carries the file hashes.
+		if rm.Compat {
+			continue
+		}
 		from, err := canon.NormalizeKey(rm.From)
 		if err != nil {
 			continue
@@ -122,37 +130,61 @@ func (e env) fetchOnce(ctx context.Context, st *store.Store, c store.Contact, ou
 		if from != ourKey && from != key {
 			continue
 		}
-		body, err := canon.Encode(from, rm.Ts, rm.Text)
+		body, err := fetchBody(rm)
 		if err != nil {
 			continue
 		}
 		if err := canon.Verify(from, body, rm.Signature); err != nil {
 			continue
 		}
+		msg, err := canon.ParseAndCheck(body, from)
+		if err != nil {
+			continue
+		}
 		id, dup, err := st.InsertMessage(store.Message{
 			PeerPub:   key,
 			FromPub:   from,
-			Ts:        rm.Ts,
-			Text:      rm.Text,
+			Ts:        msg.Ts,
+			Text:      msg.Text,
 			Body:      string(body),
 			Signature: rm.Signature,
 			Delivered: true,
 			Nudged:    true,
 		})
-		if err != nil || dup {
+		if err != nil {
+			continue
+		}
+		if blobErr == nil && len(msg.Files) > 0 {
+			if err := e.ensureBlobs(ctx, blobs, c, ourKey, msg.Files); err != nil {
+				fmt.Fprintf(e.stderr, "string-can: %v\n", err)
+			}
+		}
+		if dup {
 			continue
 		}
 		n++
-		if code := e.writeJSON(struct {
-			ID   int64  `json:"id"`
-			From string `json:"from"`
-			Ts   int64  `json:"ts"`
-			Text string `json:"text"`
-		}{id, from, rm.Ts, rm.Text}); code != 0 {
+		stored := store.Message{
+			ID: id, PeerPub: key, FromPub: from, Ts: msg.Ts, Text: msg.Text, Body: string(body),
+		}
+		if code := e.writeJSON(e.threadLine(dir, stored)); code != 0 {
 			return n, code
 		}
 	}
 	return n, 0
+}
+
+// fetchBody prefers the canonical body when the peer sent one, so a file
+// message verifies. A text-only reply from an older peer has no body, and
+// the signature is over Encode(from, ts, text).
+func fetchBody(rm push.RemoteMessage) ([]byte, error) {
+	if rm.Body != "" {
+		return []byte(rm.Body), nil
+	}
+	from, err := canon.NormalizeKey(rm.From)
+	if err != nil {
+		return nil, err
+	}
+	return canon.Encode(from, rm.Ts, rm.Text)
 }
 
 func (e env) cmdStatus(args []string) int {

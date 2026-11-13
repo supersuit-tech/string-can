@@ -277,12 +277,12 @@ func TestWatchDoesNotReprintCooldown(t *testing.T) {
 	suppress := map[int64]bool{}
 	var stdout bytes.Buffer
 	e := env{stdout: &stdout, stderr: io.Discard}
-	n, code := e.inboxOnce(st, nil, true, time.Now(), suppress)
+	n, code := e.inboxOnce(st, home.Dir{Path: dir}, nil, true, time.Now(), suppress)
 	if code != 0 || n != 1 || !strings.Contains(stdout.String(), `"reason":"cooldown"`) {
 		t.Fatalf("first n=%d code=%d %s", n, code, stdout.String())
 	}
 	stdout.Reset()
-	n, code = e.inboxOnce(st, nil, true, time.Now(), suppress)
+	n, code = e.inboxOnce(st, home.Dir{Path: dir}, nil, true, time.Now(), suppress)
 	if code != 0 || n != 0 || stdout.Len() != 0 {
 		t.Fatalf("reprinted n=%d code=%d %s", n, code, stdout.String())
 	}
