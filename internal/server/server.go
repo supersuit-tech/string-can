@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/supersuit-tech/string-can/internal/canon"
+	"github.com/supersuit-tech/string-can/internal/files"
 	"github.com/supersuit-tech/string-can/internal/home"
 	"github.com/supersuit-tech/string-can/internal/listenaddr"
 	"github.com/supersuit-tech/string-can/internal/push"
@@ -384,16 +385,21 @@ func (s *Server) retryOutbound(ctx context.Context) {
 		}
 		// A previous timeout is not proof the peer missed the message.
 		// Read the thread before POSTing again.
-		res := push.Deliver(ctx, s.peerClient, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body), push.DeliverOptions{
-			VerifyFirst: m.State == store.StateUnconfirmed,
-		})
+		opt := push.DeliverOptions{VerifyFirst: m.State == store.StateUnconfirmed}
+		if list, ferr := canon.FilesIn(m.Body); ferr == nil && len(list) > 0 {
+			if blobs, err := files.Open(s.dir.Path); err != nil {
+				s.log.Printf("wake: blobs: %v", err)
+			} else {
+				opt.OpenBlob = blobs.Open
+			}
+		}
+		res := push.Deliver(ctx, s.peerClient, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body), opt)
 		// A frozen peer never answers. Thaw it, wait, and try this delivery once more.
 		// supervise's serve child runs this loop, so an outbound-only agent wakes here too.
 		if res.Kind != push.KindDelivered && c.WakeURL != "" && wake.SendNeedsWake(res.Kind, res.Err) {
 			if wake.Try(ctx, s.store, c.PublicKey, c.BaseURL, s.pub, s.log.Printf) {
-				res = push.Deliver(ctx, s.peerClient, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body), push.DeliverOptions{
-					VerifyFirst: res.Kind == push.KindUnconfirmed || m.State == store.StateUnconfirmed,
-				})
+				opt.VerifyFirst = res.Kind == push.KindUnconfirmed || m.State == store.StateUnconfirmed
+				res = push.Deliver(ctx, s.peerClient, c.BaseURL, m.FromPub, m.Signature, []byte(m.Body), opt)
 			}
 		}
 		switch res.Kind {
@@ -402,7 +408,9 @@ func (s *Server) retryOutbound(ctx context.Context) {
 				s.log.Printf("wake: mark delivered id=%d: %v", m.ID, err)
 				continue
 			}
-			if res.Found {
+			if res.FilesSkipped {
+				s.log.Printf("wake: id=%d delivered without files: %s", m.ID, res.Detail)
+			} else if res.Found {
 				s.log.Printf("wake: id=%d verified delivered", m.ID)
 			} else {
 				s.log.Printf("wake: id=%d delivered", m.ID)
@@ -489,6 +497,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if key, sha, ok := blobPath(path); ok {
+		switch r.Method {
+		case http.MethodGet:
+			s.handleGetBlob(w, r, key, sha)
+		case http.MethodPost:
+			s.handlePostBlob(w, r, key, sha)
+		default:
+			writeError(w, http.StatusNotFound, "not found")
+		}
 		return
 	}
 	if strings.Contains(path, "/") {
@@ -620,26 +639,65 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request, peer strin
 		writeError(w, http.StatusInternalServerError, "unavailable")
 		return
 	}
-	type httpMsg struct {
-		ID        int64  `json:"id"`
-		From      string `json:"from"`
-		Ts        int64  `json:"ts"`
-		Text      string `json:"text"`
-		Signature string `json:"signature"`
-	}
-	out := make([]httpMsg, 0, len(msgs))
+	out := make([]threadMsg, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, httpMsg{
+		item := threadMsg{
 			ID:        m.ID,
 			From:      m.FromPub,
 			Ts:        m.Ts,
 			Text:      m.Text,
 			Signature: m.Signature,
-		})
+		}
+		if files, err := canon.FilesIn(m.Body); err == nil && len(files) > 0 {
+			// New fetchers verify this body. The signature field stays the
+			// signature over it, so a delivery check still finds the message.
+			item.Body = m.Body
+		}
+		out = append(out, item)
+		if extra, ok := s.compatText(m); ok {
+			out = append(out, extra)
+		}
 	}
 	writeJSON(w, http.StatusOK, struct {
-		Messages []httpMsg `json:"messages"`
+		Messages []threadMsg `json:"messages"`
 	}{Messages: out})
+}
+
+// threadMsg is one GET thread entry. Body and Compat are omitted on a
+// text-only message, which keeps the JSON an older peer already parses.
+type threadMsg struct {
+	ID        int64  `json:"id"`
+	From      string `json:"from"`
+	Ts        int64  `json:"ts"`
+	Text      string `json:"text"`
+	Signature string `json:"signature"`
+	Body      string `json:"body,omitempty"`
+	Compat    bool   `json:"compat,omitempty"`
+}
+
+// compatText is a text-only signature of a file message this agent sent.
+// An older fetcher rebuilds the body from from/ts/text and would drop the
+// real entry. It ignores Compat, verifies this signature, and keeps the text.
+func (s *Server) compatText(m store.Message) (threadMsg, bool) {
+	if m.FromPub != s.pub || m.Text == "" {
+		return threadMsg{}, false
+	}
+	files, err := canon.FilesIn(m.Body)
+	if err != nil || len(files) == 0 {
+		return threadMsg{}, false
+	}
+	body, err := canon.Encode(m.FromPub, m.Ts, m.Text)
+	if err != nil {
+		return threadMsg{}, false
+	}
+	return threadMsg{
+		ID:        m.ID,
+		From:      m.FromPub,
+		Ts:        m.Ts,
+		Text:      m.Text,
+		Signature: canon.Sign(s.priv, body),
+		Compat:    true,
+	}, true
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, pathKey string) {
@@ -670,6 +728,10 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, pathKey stri
 	}
 	if !ok {
 		writeError(w, http.StatusForbidden, push.ForbiddenContact)
+		return
+	}
+	if err := rejectOversizedFiles(msg.Files); err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
 		return
 	}
 	id, dup, err := s.store.InsertMessage(store.Message{

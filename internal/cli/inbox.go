@@ -29,13 +29,14 @@ const (
 )
 
 type inboxLine struct {
-	ID     int64  `json:"id"`
-	Peer   string `json:"peer"`
-	From   string `json:"from"`
-	Ts     int64  `json:"ts"`
-	Text   string `json:"text"`
-	Reply  string `json:"reply"`
-	Reason string `json:"reason,omitempty"`
+	ID          int64            `json:"id"`
+	Peer        string           `json:"peer"`
+	From        string           `json:"from"`
+	Ts          int64            `json:"ts"`
+	Text        string           `json:"text"`
+	Reply       string           `json:"reply"`
+	Reason      string           `json:"reason,omitempty"`
+	Attachments []attachmentJSON `json:"attachments,omitempty"`
 }
 
 type inboxItem struct {
@@ -170,7 +171,7 @@ func (e env) cmdInbox(ctx context.Context, args []string) int {
 		suppress = map[int64]bool{}
 	}
 	for {
-		n, code := e.inboxOnce(st, keys, !peek, time.Now(), suppress)
+		n, code := e.inboxOnce(st, dir, keys, !peek, time.Now(), suppress)
 		if code != 0 && !watch {
 			return code
 		}
@@ -192,7 +193,7 @@ func (e env) cmdInbox(ctx context.Context, args []string) int {
 	}
 }
 
-func (e env) inboxOnce(st *store.Store, keys []string, advance bool, now time.Time, suppress map[int64]bool) (int, int) {
+func (e env) inboxOnce(st *store.Store, dir home.Dir, keys []string, advance bool, now time.Time, suppress map[int64]bool) (int, int) {
 	capN, err := autoCap()
 	if err != nil {
 		return 0, e.fail(err)
@@ -239,13 +240,14 @@ func (e env) inboxOnce(st *store.Store, keys []string, advance bool, now time.Ti
 		}
 		item := inboxItem{
 			line: inboxLine{
-				ID:     c.m.ID,
-				Peer:   c.m.PeerPub,
-				From:   c.m.FromPub,
-				Ts:     c.m.Ts,
-				Text:   c.m.Text,
-				Reply:  reply,
-				Reason: reason,
+				ID:          c.m.ID,
+				Peer:        c.m.PeerPub,
+				From:        c.m.FromPub,
+				Ts:          c.m.Ts,
+				Text:        c.m.Text,
+				Reply:       reply,
+				Reason:      reason,
+				Attachments: attachmentViews(dir, c.m),
 			},
 			advance: adv,
 		}
