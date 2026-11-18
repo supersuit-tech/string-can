@@ -382,6 +382,84 @@ func TestFetchWakesFrozenPeer(t *testing.T) {
 	}
 }
 
+func TestFetchDoesNotWakeFrozenPeerWhenSendOnly(t *testing.T) {
+	t.Setenv("STRING_CAN_WAKE_WAIT", "2s")
+	t.Setenv("STRING_CAN_WAKE_POLL", "10ms")
+	t.Setenv("STRING_CAN_WAKE_INTERVAL", "2m")
+	t.Setenv("STRING_CAN_PEER_TIMEOUT", "500ms")
+	t.Setenv("STRING_CAN_WAKE_SEND_ONLY", "1")
+
+	const token = "send-only-fetch-secret"
+	home, _ := newHome(t)
+	peerKey, peer, hook, wakes, _, _ := frozenPeer(t, token, func(up *atomic.Bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			_ = up
+			drop(w)
+		}
+	})
+	if err := storeWake(t, home, peerKey, peer.URL, hook.URL, token); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runCLI(t, "fetch", peerKey)
+	if code == 0 {
+		t.Fatalf("fetch of a frozen peer should fail, stdout %q stderr %q", stdout, stderr)
+	}
+	if wakes.Load() != 0 {
+		t.Fatalf("wakes %d stderr %s", wakes.Load(), stderr)
+	}
+	assertNoSecret(t, stdout+stderr, token, "")
+}
+
+func TestSendStillWakesFrozenPeerWhenSendOnly(t *testing.T) {
+	t.Setenv("STRING_CAN_WAKE_WAIT", "2s")
+	t.Setenv("STRING_CAN_WAKE_POLL", "10ms")
+	t.Setenv("STRING_CAN_WAKE_INTERVAL", "2m")
+	t.Setenv("STRING_CAN_PEER_TIMEOUT", "500ms")
+	t.Setenv("STRING_CAN_WAKE_SEND_ONLY", "1")
+
+	const (
+		token   = "send-only-send-secret-token"
+		message = "unique-message-after-idle-send-only"
+	)
+	home, from := newHome(t)
+	peerKey, peer, hook, wakes, body, auth := frozenPeer(t, token, func(up *atomic.Bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if !up.Load() {
+				drop(w)
+				return
+			}
+			if r.URL.Path == "/" {
+				writeInfo(w, peerKeyPlaceholder)
+				return
+			}
+			if r.Method == http.MethodGet {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"messages":[]}`)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+		}
+	})
+	if err := storeWake(t, home, peerKey, peer.URL, hook.URL+"/hooks/"+token, token); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runCLI(t, "send", peerKey, message)
+	if code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", code, stdout, stderr)
+	}
+	if strings.TrimSpace(stdout) != "sent 1" {
+		t.Fatalf("stdout %q stderr %q", stdout, stderr)
+	}
+	if wakes.Load() != 1 {
+		t.Fatalf("wakes %d", wakes.Load())
+	}
+	assertWakeCall(t, body, auth, token, message, from)
+	assertNoSecret(t, stderr, token, message)
+	if !strings.Contains(stderr, "peer wake: posted") || !strings.Contains(stderr, "is up") {
+		t.Fatalf("stderr %s", stderr)
+	}
+}
+
 func TestHTTPFailureDoesNotWake(t *testing.T) {
 	const token = "http-secret-token"
 	home, _ := newHome(t)

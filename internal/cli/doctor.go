@@ -105,7 +105,11 @@ func (e env) cmdFetch(ctx context.Context, args []string) int {
 func (e env) fetchOnce(ctx context.Context, st *store.Store, dir home.Dir, c store.Contact, ourKey string) (int, int) {
 	key := c.PublicKey
 	remote, err := push.Thread(ctx, push.PeerClient(), c.BaseURL, ourKey)
-	if err != nil && !c.PullOnly && c.WakeURL != "" && wake.FetchNeedsWake(err) {
+	// In send-only mode a failed fetch never thaws the peer: a sleeping
+	// peer cannot have written new messages, so waking it to poll finds
+	// nothing. Sends still wake it, and messages it wrote before freezing
+	// wait until it wakes on its own.
+	if err != nil && !c.PullOnly && c.WakeURL != "" && !wake.SendOnly() && wake.FetchNeedsWake(err) {
 		if wake.Try(ctx, st, key, c.BaseURL, ourKey, e.logf()) {
 			remote, err = push.Thread(ctx, push.PeerClient(), c.BaseURL, ourKey)
 		}

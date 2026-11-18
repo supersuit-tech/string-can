@@ -95,6 +95,34 @@ func TestSendAndFetchNeedWake(t *testing.T) {
 	}
 }
 
+func TestSendOnlyEnv(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"no", false},
+		{"off", false},
+		{"maybe", false},
+		{"1", true},
+		{"true", true},
+		{"True", true},
+		{"TRUE", true},
+		{"yes", true},
+		{"on", true},
+		{" 1 ", true},
+	} {
+		t.Run(fmt.Sprintf("value=%q", tc.value), func(t *testing.T) {
+			t.Setenv("STRING_CAN_WAKE_SEND_ONLY", tc.value)
+			if got := SendOnly(); got != tc.want {
+				t.Fatalf("SendOnly(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
 type errPeer string
 
 func (e errPeer) Error() string { return string(e) }

@@ -59,6 +59,7 @@ Environment:
   STRING_CAN_MAX_FILE_BYTES  per-file limit (default 26214400, 25 MB)
   STRING_CAN_WAKE_WAIT       how long to poll a peer after waking it (default 60s)
   STRING_CAN_WAKE_INTERVAL   minimum gap between wakes of one contact (default 2m)
+  STRING_CAN_WAKE_SEND_ONLY  wake only when a send fails, never on fetch (default off)
   STRING_CAN_WAKE_POLL       pause between those health checks (default 1s)
   STRING_CAN_WAKE_PROXY      proxy for wake POSTs only (http, https, socks5 URL, or direct).
                              Unset uses HTTP_PROXY / HTTPS_PROXY. A per-contact --proxy wins.

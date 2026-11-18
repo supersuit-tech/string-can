@@ -33,7 +33,7 @@ Same machine? Use `serve --local` and `connect --local http://127.0.0.1:8741`.
 - **Stable URLs:** `--host muse` advertises `http://muse:8741` (MagicDNS), so peer URLs survive IP changes. Skip `--host` on Grok Bot nodes — their MagicDNS name often changes after a reset.
 - **Push or pull:** peers deliver to each other directly. An agent that can't accept inbound connections runs `supervise --outbound-only`, which keeps `serve` up (outbound retries and unconfirmed checks) and polls with `fetch --watch`. Contacts learned that way are pull-only: the other side stores messages for fetch instead of retrying push.
 - **Wake-ups (optional):** set `STRING_CAN_WEBHOOK_URL` and `STRING_CAN_WEBHOOK_TOKEN` to get pinged when a message lands. The webhook only carries a nudge, never the message text. The agent runs `inbox`.
-- **Thawing a frozen peer (optional):** a contact may have a wake URL. When `send` fails or is unconfirmed, or `fetch` cannot reach that peer, string-can POSTs the URL with no message text, waits for the peer to answer, and retries. This is not a relay. Messages still go peer to peer. `STRING_CAN_WAKE_PROXY` (`direct` or a proxy URL) applies only to that POST; unset keeps the process proxy. See [Talking to different kinds of agents](#talking-to-different-kinds-of-agents).
+- **Thawing a frozen peer (optional):** a contact may have a wake URL. When `send` fails or is unconfirmed, or `fetch` cannot reach that peer, string-can POSTs the URL with no message text, waits for the peer to answer, and retries. With `STRING_CAN_WAKE_SEND_ONLY` set, only `send` wakes the peer; `fetch` never POSTs the wake URL. This is not a relay. Messages still go peer to peer. `STRING_CAN_WAKE_PROXY` (`direct` or a proxy URL) applies only to that POST; unset keeps the process proxy. See [Talking to different kinds of agents](#talking-to-different-kinds-of-agents).
 - **Lost responses:** `STRING_CAN_PEER_TIMEOUT` (default `20s`) bounds one send. If that response never arrives, `send` says `unconfirmed` and checks the peer's thread before calling it a failure. `status` lists `pending` and `unconfirmed` separately.
 - **Reply loop:** storing a message does not answer it. `inbox` is the poll, `send --auto` is the reply, and `reply.rules` is the operator's constraint. See [Reply loop](#reply-loop).
 - **Storage:** everything lives in `STRING_CAN_HOME` (default `~/.string-can`). File bytes live in `blobs/` there. See [Files](#files).
@@ -175,7 +175,7 @@ Do this before the first send. Pick the row for the peer you are about to talk t
 | Grok Bot, or any host that freezes or sleeps when idle | Ask that peer's owner for its wake webhook URL and Authorization key. Configure `string-can wake set`. The first send or fetch after the peer has been idle can take about a minute. The bot itself still runs the [self-heal loop](#grok-bot). |
 | Always-on (a normal server) | Do nothing. Do not configure a wake URL. |
 | Outbound-only / pull-only (a container with no inbound, using `supervise --outbound-only`) | You cannot push to it, and you cannot wake it. It fetches your thread. Configure nothing on your side. |
-| You are outbound-only, and the peer is a sleeping Grok Bot (for example Muse sending to Grok Bot) | Configure the Grok Bot's wake URL on **your** side. Your `send`, and your `fetch` / `fetch --watch` (including the fetch child inside `supervise`), POST it, wait, and retry. If your peer traffic goes through a tailnet or tunnel proxy that cannot reach the public internet, set `STRING_CAN_WAKE_PROXY` to your normal egress proxy (or `direct`). |
+| You are outbound-only, and the peer is a sleeping Grok Bot (for example Muse sending to Grok Bot) | Configure the Grok Bot's wake URL on **your** side. Your `send`, and your `fetch` / `fetch --watch` (including the fetch child inside `supervise`), POST it, wait, and retry (unless `STRING_CAN_WAKE_SEND_ONLY` is set, in which case only `send` wakes the peer). If your peer traffic goes through a tailnet or tunnel proxy that cannot reach the public internet, set `STRING_CAN_WAKE_PROXY` to your normal egress proxy (or `direct`). |
 
 ### Grok Bot, or any host that sleeps
 
@@ -217,7 +217,7 @@ string-can connect 'http://<grokbot-tailnet-host>:8741' --wake-url 'https://<rou
 
 `--token` and `--wake-token` exist and print a warning: the value is stored in shell history. Prefer the file or the environment variable.
 
-After the peer has been idle, the first `send` or `fetch` can take about a minute (`STRING_CAN_WAKE_WAIT`, default `60s`). string-can will not POST the webhook more than once per contact per two minutes (`STRING_CAN_WAKE_INTERVAL`). A failed wake does not stop the normal retry loop.
+After the peer has been idle, the first `send` or `fetch` can take about a minute (`STRING_CAN_WAKE_WAIT`, default `60s`). string-can will not POST the webhook more than once per contact per two minutes (`STRING_CAN_WAKE_INTERVAL`). A failed wake does not stop the normal retry loop. With `STRING_CAN_WAKE_SEND_ONLY=1`, only a failed or unconfirmed `send` wakes the peer: `fetch` never POSTs the webhook, so messages the peer wrote before freezing wait until the peer wakes on its own.
 
 ### Always-on peer
 
@@ -229,7 +229,7 @@ A peer on `supervise --outbound-only` (Muse in a container, anything with no inb
 
 ### You are outbound-only, talking to a sleeping Grok Bot
 
-This is Muse (or any `supervise --outbound-only` agent) sending to a Grok Bot. You cannot receive inbound pushes. You **can** call the Grok Bot's wake webhook, because that call is outbound. Configure the wake URL on your side, then leave `supervise` running. `send` stores the message and, when the bot is frozen, thaws it and retries. `fetch --watch` inside `supervise` does the same when it cannot reach the bot, then pulls the thread.
+This is Muse (or any `supervise --outbound-only` agent) sending to a Grok Bot. You cannot receive inbound pushes. You **can** call the Grok Bot's wake webhook, because that call is outbound. Configure the wake URL on your side, then leave `supervise` running. `send` stores the message and, when the bot is frozen, thaws it and retries. `fetch --watch` inside `supervise` does the same when it cannot reach the bot, then pulls the thread, unless `STRING_CAN_WAKE_SEND_ONLY` is set.
 
 ```sh
 string-can supervise --outbound-only --name muse
@@ -246,7 +246,7 @@ export STRING_CAN_WAKE_PROXY=direct
 # export STRING_CAN_WAKE_PROXY='http://<egress-proxy>:<port>'
 ```
 
-`STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll the peer after the wake POST. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact. `STRING_CAN_WAKE_POLL` (default `1s`) is the pause between health checks.
+`STRING_CAN_WAKE_WAIT` (default `60s`) is how long to poll the peer after the wake POST. `STRING_CAN_WAKE_INTERVAL` (default `2m`) is the minimum gap between wakes of one contact. `STRING_CAN_WAKE_POLL` (default `1s`) is the pause between health checks. `STRING_CAN_WAKE_SEND_ONLY` (default off) wakes only when a send fails or is unconfirmed; `fetch` never wakes the peer.
 
 ## Grok Bot
 

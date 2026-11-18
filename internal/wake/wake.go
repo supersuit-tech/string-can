@@ -261,6 +261,20 @@ func durationEnv(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// SendOnly reports whether STRING_CAN_WAKE_SEND_ONLY disables fetch wakes.
+// When set to 1, true, yes, or on, only a failed or unconfirmed send thaws
+// the peer; a fetch that cannot reach the peer never POSTs the wake URL.
+// Anything else, including an empty or unrecognized value, keeps the
+// default: sends and fetches both wake the peer.
+func SendOnly() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("STRING_CAN_WAKE_SEND_ONLY"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // SendNeedsWake reports whether a failed or unconfirmed delivery should
 // thaw the peer. An HTTP status means the peer already answered, so it is
 // not frozen.
